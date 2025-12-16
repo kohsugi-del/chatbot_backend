@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+python-dotenv
 pydantic
 python-multipart
 requests
@@ -9,3 +10,4 @@ pypdf
 langchain-text-splitters
 openai
 numpy
+supabase
