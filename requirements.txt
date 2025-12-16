@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+requests
+beautifulsoup4
+lxml
+pypdf
+langchain-text-splitters
+openai
+numpy
