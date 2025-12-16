@@ -60,4 +60,18 @@ def ask(body: ChatBody):
     refs = [{"source": d["source"], "score": float(s)} for d, s in retrieved]
     return {"answer": ans, "references": refs}
 
+# ==== 追加：Embed 用 =====
+class EmbedBody(BaseModel):
+    question: str
+    top_k: int = 5
+
+
+@app.post("/embed")
+def embed(body: EmbedBody):
+    retrieved = search(body.question, top_k=body.top_k)
+    ans = answer(body.question, retrieved)
+    return {
+        "answer": ans
+    }
+
 
