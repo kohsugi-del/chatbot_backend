@@ -13,7 +13,7 @@ app = FastAPI(title="RAG Chat API")
 # CORS（Next.jsローカル用）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,7 +30,7 @@ class IngestBody(BaseModel):
 
 
 class ChatBody(BaseModel):
-    message: str
+    question: str
     top_k: int = 3
 
 
@@ -53,9 +53,11 @@ def upload_pdf(file: UploadFile = File(...)):
     return {"status": "ok", "path": save_path, "added_chunks": added}
 
 
-@app.post("/chat")
-def chat(body: ChatBody):
-    retrieved = search(body.message, top_k=body.top_k)
-    ans = answer(body.message, retrieved)
+@app.post("/ask")
+def ask(body: ChatBody):
+    retrieved = search(body.question, top_k=body.top_k)
+    ans = answer(body.question, retrieved)
     refs = [{"source": d["source"], "score": float(s)} for d, s in retrieved]
     return {"answer": ans, "references": refs}
+
+
