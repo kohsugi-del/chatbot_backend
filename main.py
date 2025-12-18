@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List
 import os, shutil
 from dotenv import load_dotenv
+from fastapi import BackgroundTasks
 load_dotenv()
 
 from rag_core import build_index, search, answer
@@ -74,4 +75,110 @@ def embed(body: EmbedBody):
         "answer": ans
     }
 
+# ===== ここから追加 =====
+
+from database import SessionLocal, engine
+from models_site import Site
+from schemas_site import SiteCreate, SiteResponse, ReingestResponse
+from sqlalchemy.orm import Session
+from fastapi import Depends, HTTPException
+
+# テーブル作成
+Site.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ----------------------------
+# POST /sites
+# ----------------------------
+@app.post("/sites", response_model=SiteResponse)
+def create_site(
+    site: SiteCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    # ① DB保存
+    new_site = Site(
+        url=site.url,
+        scope=site.scope,
+        type=site.type,
+    )
+    db.add(new_site)
+    db.commit()
+    db.refresh(new_site)
+
+    # ② バックグラウンドで ingest 実行
+    background_tasks.add_task(
+        ingest_site_background,
+        site.url,
+    )
+
+    return new_site
+
+# ----------------------------
+# GET /sites
+# ----------------------------
+@app.get("/sites", response_model=list[SiteResponse])
+def list_sites(db: Session = Depends(get_db)):
+    return db.query(Site).order_by(Site.id.desc()).all()
+
+# ----------------------------
+# DELETE /sites/{id}
+# ----------------------------
+@app.delete("/sites/{site_id}")
+def delete_site(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(Site).filter(Site.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+
+    db.delete(site)
+    db.commit()
+    return {"status": "deleted"}
+
+# ===== 追加ここまで =====
+
+def ingest_site_background(url: str):
+    """
+    サイト登録後にバックグラウンドで実行される ingest
+    """
+    try:
+        build_index([url], [])
+        print(f"[INGEST DONE] {url}")
+    except Exception as e:
+        print(f"[INGEST ERROR] {url}", e)
+
+from fastapi import BackgroundTasks
+
+@app.post(
+        "/sites/{site_id}/reingest",
+        response_model=ReingestResponse
+)
+def reingest_site(
+    site_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    site = db.query(Site).filter(Site.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+
+    # status を pending に戻す
+    site.status = "pending"
+    db.commit()
+
+    # 再 ingest をバックグラウンド実行
+    background_tasks.add_task(
+        ingest_site_background,
+        site.id,
+    )
+
+    return {
+        "status": "reingest_started",
+        "site_id": site.id,
+    }
 
