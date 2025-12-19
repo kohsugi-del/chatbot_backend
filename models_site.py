@@ -6,7 +6,9 @@ class Site(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     url = Column(String, nullable=False)
-    scope = Column(String, nullable=False)   # all / single / one-level
-    type = Column(String, nullable=False)    # WordPress / Headless CMS / 静的HTML
-
+    scope = Column(String, nullable=False)
+    type = Column(String, nullable=False)
     status = Column(String, nullable=False, default="pending")
+
+    # ★ 追加
+    ingested_urls = Column(Integer, nullable=True)

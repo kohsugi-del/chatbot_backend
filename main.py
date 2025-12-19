@@ -5,6 +5,9 @@ from typing import List
 import os, shutil
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks
+from crawler_utils import resolve_urls_by_scope
+from bs4 import BeautifulSoup
+from models_file import File as FileModel
 load_dotenv()
 
 from rag_core import build_index, search, answer
@@ -14,8 +17,11 @@ app = FastAPI(title="RAG Chat API")
 # CORS（Next.jsローカル用）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -102,23 +108,23 @@ def create_site(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # ① DB保存
-    new_site = Site(
+    db_site = Site(
         url=site.url,
         scope=site.scope,
         type=site.type,
+        status="pending",
     )
-    db.add(new_site)
+    db.add(db_site)
     db.commit()
-    db.refresh(new_site)
+    db.refresh(db_site)
 
-    # ② バックグラウンドで ingest 実行
+    # ★ これが無いと一生「準備中」
     background_tasks.add_task(
         ingest_site_background,
-        site.url,
+        db_site.id,
     )
 
-    return new_site
+    return db_site
 
 # ----------------------------
 # GET /sites
@@ -142,15 +148,39 @@ def delete_site(site_id: int, db: Session = Depends(get_db)):
 
 # ===== 追加ここまで =====
 
-def ingest_site_background(url: str):
-    """
-    サイト登録後にバックグラウンドで実行される ingest
-    """
+def ingest_site_background(site_id: int):
+    print(f"[INGEST START] site_id={site_id}")  # ← 追加
+    db = SessionLocal()
     try:
-        build_index([url], [])
-        print(f"[INGEST DONE] {url}")
+        site = db.query(Site).filter(Site.id == site_id).first()
+        if not site:
+            return
+
+        # crawling に変更
+        site.status = "crawling"
+        db.commit()
+
+        # ★ここが追加されたポイント
+        urls = resolve_urls_by_scope(site.url, site.scope)
+
+        # ★ URL数を保存
+        site.ingested_urls = len(urls)
+        db.commit()
+
+        # ingest 実行
+        build_index(urls, [])
+
+        # 完了
+        site.status = "done"
+        db.commit()
+
     except Exception as e:
-        print(f"[INGEST ERROR] {url}", e)
+        site.status = "error"
+        db.commit()
+        print("[INGEST ERROR]", e)
+
+    finally:
+        db.close()
 
 from fastapi import BackgroundTasks
 
@@ -182,3 +212,91 @@ def reingest_site(
         "site_id": site.id,
     }
 
+from schemas_file import FileResponse  # ★ これを追加
+
+@app.post("/files", response_model=FileResponse)
+def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    save_path = os.path.join(DATA_DIR, file.filename)
+    with open(save_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    db_file = FileModel(
+        filename=file.filename,
+        path=save_path,
+        status="pending",
+    )
+    db.add(db_file)
+    db.commit()
+    db.refresh(db_file)
+
+    background_tasks.add_task(
+        ingest_file_background,
+        db_file.id,
+    )
+
+    return db_file
+
+def ingest_file_background(file_id: int):
+    db = SessionLocal()
+    try:
+        f = db.query(FileModel).filter(FileModel.id == file_id).first()
+        if not f:
+            return
+
+        f.status = "processing"
+        db.commit()
+
+        added = build_index([], [f.path])
+
+        f.ingested_chunks = added
+        f.status = "done"
+        db.commit()
+
+    except Exception as e:
+        f.status = "error"
+        db.commit()
+        print("[FILE INGEST ERROR]", e)
+
+    finally:
+        db.close()
+
+@app.get("/files", response_model=list[FileResponse])
+def list_files(db: Session = Depends(get_db)):
+    return db.query(FileModel).order_by(FileModel.id.desc()).all()
+
+@app.delete("/files/{file_id}")
+def delete_file(file_id: int, db: Session = Depends(get_db)):
+    f = db.query(FileModel).filter(FileModel.id == file_id).first()
+    if not f:
+        raise HTTPException(status_code=404)
+
+    if os.path.exists(f.path):
+        os.remove(f.path)
+
+    db.delete(f)
+    db.commit()
+    return {"status": "deleted"}
+
+@app.post("/files/{file_id}/reingest")
+def reingest_file(
+    file_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    f = db.query(FileModel).filter(FileModel.id == file_id).first()
+    if not f:
+        raise HTTPException(status_code=404)
+
+    f.status = "pending"
+    db.commit()
+
+    background_tasks.add_task(
+        ingest_file_background,
+        f.id,
+    )
+
+    return {"status": "reingest_started"}
