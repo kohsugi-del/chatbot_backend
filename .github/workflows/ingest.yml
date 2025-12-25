@@ -43,9 +43,8 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           python ingest.py \
-            --site-id 1 \
-            --seed-url https://hataraku-asahikawa.jp/ \
-            --allowed-paths "/job/,/jobs/,/recruit/,/company/,/column/,/columns/" \
-            --max-pages ${{ github.event.inputs.max_pages || '50' }} \
-            --batch-size ${{ github.event.inputs.batch_size || '5' }} \
-            --sleep-sec 1
+              --site-id 1 \
+              --seed-url https://hataraku-asahikawa.jp/ \
+              --max-pages 50 \
+              --batch-size 5 \
+              --sleep-sec 1
