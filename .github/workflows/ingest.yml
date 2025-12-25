@@ -45,6 +45,6 @@ jobs:
           python chatbot_backend/ingest.py \
             --site-id 1 \
             --seed-url https://hataraku-asahikawa.jp/ \
-            --max-pages 50 \
-            --batch-size 5 \
+            --max-pages 300 \
+            --batch-size 10 \
             --sleep-sec 1

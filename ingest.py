@@ -36,6 +36,23 @@ supabase: Client = create_client(
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
 
+# ===== はたらくあさひかわ専用 =====
+
+ALLOWED_PATHS = [
+    "/columns/",
+]
+
+DENY_PATTERNS = [
+    r"/page/\d+/?$",   # ページネーション
+    r"/tag/",
+    r"/category/",
+    r"/wp-content/",
+    r"/wp-json/",
+]
+
+DENY_QUERY = True      # ?つきURLは除外
+DENY_FRAGMENT = True  # #付きURLは除外
+
 
 # ==============
 # ユーティリティ
@@ -56,9 +73,26 @@ def normalize_url(u: str) -> str:
 
 def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
     p = urlparse(url)
+    # ドメインチェック
     if p.netloc != base_host:
         return False
+
+    # クエリ除外
+    if DENY_QUERY and p.query:
+        return False
+
+    # フラグメント除外
+    if DENY_FRAGMENT and p.fragment:
+        return False
+
     path = p.path or "/"
+
+    # deny パターン
+    for pat in DENY_PATTERNS:
+        if re.search(pat, path):
+            return False
+
+    # allow 判定
     if not allowed_paths:
         return True
     return any(path.startswith(ap) for ap in allowed_paths)
