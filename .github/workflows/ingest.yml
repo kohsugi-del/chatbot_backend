@@ -1,21 +1,23 @@
 name: Nightly RAG Ingest
 
 on:
-  # 毎日 深夜3時（JST = UTC+9 → UTC 18時）
   schedule:
     - cron: "0 18 * * *"
 
-  # 手動実行
   workflow_dispatch:
     inputs:
       max_pages:
-        description: "Max pages to ingest"
+        description: "Max pages to ingest (common default)"
         required: false
         default: "50"
       batch_size:
-        description: "Batch size"
+        description: "Batch size (common default)"
         required: false
         default: "5"
+      sleep_sec:
+        description: "Sleep seconds"
+        required: false
+        default: "1"
 
 jobs:
   ingest:
@@ -44,6 +46,8 @@ jobs:
             exit 1
           fi
           pip install -r "$REQ"
+          # 念のため（sites.ymlを読むため）
+          pip show pyyaml >/dev/null 2>&1 || pip install pyyaml
 
       - name: Run ingest
         env:
@@ -59,20 +63,24 @@ jobs:
             exit 1
           fi
 
-          echo "== sites.yml =="
+          echo "== find sites.yml =="
+          # 1) ingest.pyと同階層、2) repo内どこか、の順に探す
           SITES_YML="$(dirname "$ING")/sites.yml"
-          echo "SITES_YML=$SITES_YML"
           if [ ! -f "$SITES_YML" ]; then
-            echo "sites.yml not found at $SITES_YML"
+            SITES_YML="$(find . -maxdepth 6 -name sites.yml | head -n 1)"
+          fi
+          echo "SITES_YML=$SITES_YML"
+          if [ -z "$SITES_YML" ] || [ ! -f "$SITES_YML" ]; then
+            echo "sites.yml not found"
             exit 1
           fi
 
           MAX_PAGES="${{ github.event.inputs.max_pages || '50' }}"
           BATCH_SIZE="${{ github.event.inputs.batch_size || '5' }}"
+          SLEEP_SEC="${{ github.event.inputs.sleep_sec || '1' }}"
 
           python "$ING" \
             --sites-yml "$SITES_YML" \
             --max-pages "$MAX_PAGES" \
             --batch-size "$BATCH_SIZE" \
-            --sleep-sec 1
-
+            --sleep-sec "$SLEEP_SEC"
