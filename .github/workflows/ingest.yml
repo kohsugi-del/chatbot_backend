@@ -51,9 +51,18 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python ingest.py \
+          echo "== find ingest.py =="
+          ING="$(find . -maxdepth 4 -name ingest.py | head -n 1)"
+          echo "ING=$ING"
+          if [ -z "$ING" ]; then
+            echo "ingest.py not found"
+            exit 1
+          fi
+
+          python "$ING" \
             --site-id 1 \
             --seed-url https://hataraku-asahikawa.jp/ \
-            --max-pages 300 \
-            --batch-size 10 \
+            --max-pages 50 \
+            --batch-size 5 \
             --sleep-sec 1
+
