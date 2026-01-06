@@ -1,6 +1,8 @@
 sites:
-  - id: 1
-    url: "https://www.hataraku-asahikawa.jp/"
-    scope: "all"
-    type: "静的HTML"
-    enabled: true
+  - site_id: 1
+    seed_url: "https://hataraku-asahikawa.jp/"
+    allowed_paths:
+      - "/columns/"
+    max_pages: 50
+    batch_size: 5
+

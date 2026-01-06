@@ -1,5 +1,5 @@
 # ingest.py
-import os, re, time, json, hashlib, argparse
+import os, re, time, hashlib, argparse
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -36,12 +36,7 @@ supabase: Client = create_client(
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
 
-# ===== はたらくあさひかわ専用 =====
-
-ALLOWED_PATHS = [
-    "/columns/",
-]
-
+# ===== 共通フィルタ設定（必要なら env で調整してもOK） =====
 DENY_PATTERNS = [
     r"/page/\d+/?$",   # ページネーション
     r"/tag/",
@@ -49,9 +44,8 @@ DENY_PATTERNS = [
     r"/wp-content/",
     r"/wp-json/",
 ]
-
 DENY_QUERY = True      # ?つきURLは除外
-DENY_FRAGMENT = True  # #付きURLは除外
+DENY_FRAGMENT = True   # #付きURLは除外
 
 
 # ==============
@@ -61,11 +55,9 @@ def sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 def normalize_url(u: str) -> str:
-    # 末尾スラッシュ統一、フラグメント除去
     u = u.split("#")[0]
     if u.endswith("/"):
         return u
-    # パスが空なら / を付ける
     parsed = urlparse(u)
     if parsed.path == "":
         return u + "/"
@@ -73,6 +65,7 @@ def normalize_url(u: str) -> str:
 
 def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
     p = urlparse(url)
+
     # ドメインチェック
     if p.netloc != base_host:
         return False
@@ -81,7 +74,7 @@ def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
     if DENY_QUERY and p.query:
         return False
 
-    # フラグメント除外
+    # フラグメント除外（normalize_urlで落としているが念のため）
     if DENY_FRAGMENT and p.fragment:
         return False
 
@@ -112,23 +105,19 @@ def extract_links(html: str, base_url: str) -> list[str]:
 def extract_text(html: str) -> tuple[str, str]:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 不要要素削除
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
         tag.decompose()
 
     title = (soup.title.string.strip() if soup.title and soup.title.string else "")
 
-    # main優先、なければbody
     main = soup.find("main")
     node = main if main else soup.body
     text = node.get_text("\n", strip=True) if node else soup.get_text("\n", strip=True)
 
-    # 連続改行を整理
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return title, text
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
-    # シンプルな文字数チャンク（日本語でも安定）
     chunks = []
     i = 0
     n = len(text)
@@ -143,7 +132,6 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
     return chunks
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    # バッチでembedding
     res = client.embeddings.create(
         model=EMBED_MODEL,
         input=texts,
@@ -158,7 +146,6 @@ def state_get(site_id: int) -> dict:
     r = supabase.table("ingest_state").select("*").eq("site_id", site_id).execute()
     if r.data:
         return r.data[0]
-    # 無ければ作る
     init = {
         "site_id": site_id,
         "cursor": 0,
@@ -179,7 +166,6 @@ def state_update(site_id: int, **kwargs):
 # Supabase: documents upsert
 # ==============
 def upsert_documents(rows: list[dict]):
-    # documents_site_url_chunk_ux により同一chunkは上書き可能
     supabase.table("documents").upsert(rows, on_conflict="site_id,url,chunk_index").execute()
 
 
@@ -187,7 +173,6 @@ def upsert_documents(rows: list[dict]):
 # Crawl: sitemap優先 → 無ければ簡易BFS
 # ==============
 def fetch_sitemap_urls(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[str]:
-    # /sitemap.xml を試す
     parsed = urlparse(seed_url)
     sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
     try:
@@ -241,7 +226,7 @@ def bfs_crawl(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[s
 
 
 # ==============
-# メイン ingest
+# メイン ingest（単体）
 # ==============
 def run_ingest(
     site_id: int,
@@ -257,13 +242,11 @@ def run_ingest(
 ):
     st = state_get(site_id)
 
-    # cursor上書き（明示resume）
     if resume_from is not None:
         st["cursor"] = resume_from
 
     state_update(site_id, status="running", last_error=None)
 
-    # 1) URLリスト確定（sitemap優先）
     urls = fetch_sitemap_urls(seed_url, allowed_paths, max_pages)
     if not urls:
         urls = bfs_crawl(seed_url, allowed_paths, max_pages)
@@ -279,15 +262,14 @@ def run_ingest(
     cursor = min(max(cursor, 0), total)
 
     print(f"[ingest] site_id={site_id} total={total} cursor={cursor}")
+    print(f"[ingest] seed_url={seed_url}")
     print(f"[ingest] allowed_paths={allowed_paths} max_pages={max_pages} batch={batch_size}")
 
-    # 2) 分割実行
     while cursor < total:
         batch_urls = urls[cursor: cursor + batch_size]
         print(f"\n[batch] cursor={cursor} -> {cursor + len(batch_urls) - 1}")
 
-        # 2-1) HTML取得 & テキスト抽出 & chunk化
-        docs = []  # (url, title, chunks, hashlist)
+        docs = []
         for u in batch_urls:
             try:
                 state_update(site_id, last_url=u)
@@ -313,10 +295,9 @@ def run_ingest(
                 state_update(site_id, last_error=str(e))
                 continue
 
-        # 2-2) embedding & upsert（チャンク単位）
         rows = []
         embed_inputs = []
-        meta = []  # rowsに対応するメタ
+        meta = []
 
         for (u, title, chunks) in docs:
             for i, c in enumerate(chunks):
@@ -343,7 +324,6 @@ def run_ingest(
                 upsert_documents(rows)
                 print(f"[db] upserted {len(rows)} chunks")
 
-        # 2-3) cursor更新（＝再開地点）
         cursor += batch_size
         state_update(site_id, cursor=min(cursor, total))
 
@@ -354,10 +334,69 @@ def run_ingest(
     print("\n[ingest] DONE")
 
 
+# ==============
+# sites.yml 読み込み（複数サイト）
+# ==============
+def load_sites_yml(path: str) -> list[dict]:
+    try:
+        import yaml  # type: ignore
+    except Exception as e:
+        raise RuntimeError("PyYAML is required for --sites-yml. Please add pyyaml to requirements.txt") from e
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    # 許容形式：
+    # sites: [{site_id: 1, seed_url: "...", allowed_paths: [...]}, ...]
+    sites = data.get("sites")
+    if not isinstance(sites, list) or not sites:
+        raise ValueError("sites.yml must have 'sites:' as a non-empty list")
+
+    norm = []
+    for i, s in enumerate(sites):
+        if not isinstance(s, dict):
+            raise ValueError(f"sites.yml: sites[{i}] must be a mapping")
+
+        site_id = s.get("site_id")
+        seed_url = s.get("seed_url")
+        if site_id is None or seed_url is None:
+            raise ValueError(f"sites.yml: sites[{i}] requires site_id and seed_url")
+
+        allowed_paths = s.get("allowed_paths", [])
+        if isinstance(allowed_paths, str):
+            # "a,b,c" 形式も許可
+            allowed_paths = [x.strip() for x in allowed_paths.split(",") if x.strip()]
+        elif isinstance(allowed_paths, list):
+            allowed_paths = [str(x).strip() for x in allowed_paths if str(x).strip()]
+        else:
+            allowed_paths = []
+
+        norm.append({
+            "site_id": int(site_id),
+            "seed_url": str(seed_url),
+            "allowed_paths": allowed_paths,
+            # サイト別override（無ければ None）
+            "max_pages": s.get("max_pages"),
+            "batch_size": s.get("batch_size"),
+            "sleep_sec": s.get("sleep_sec"),
+            "max_chars": s.get("max_chars"),
+            "overlap": s.get("overlap"),
+            "resume_from": s.get("resume_from"),
+        })
+    return norm
+
+
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--site-id", type=int, required=True)
-    p.add_argument("--seed-url", type=str, required=True)
+
+    # 複数サイト実行
+    p.add_argument("--sites-yml", type=str, default="")
+
+    # 単体実行（sites-yml が無い場合に必須）
+    p.add_argument("--site-id", type=int)
+    p.add_argument("--seed-url", type=str)
+
+    # 共通オプション（sites-yml でも共通値として使う）
     p.add_argument("--max-pages", type=int, default=300)
     p.add_argument("--allowed-paths", type=str, default="")
     p.add_argument("--batch-size", type=int, default=10)
@@ -366,20 +405,73 @@ def parse_args():
     p.add_argument("--overlap", type=int, default=250)
     p.add_argument("--resume-from", type=int, default=None)
     p.add_argument("--dry-run", action="store_true")
+
     return p.parse_args()
+
 
 if __name__ == "__main__":
     a = parse_args()
+
+    # sites.yml モード
+    if a.sites_yml:
+        sites = load_sites_yml(a.sites_yml)
+
+        # 共通 allowed_paths（CLIから渡したい場合）
+        allowed_common = [s.strip() for s in a.allowed_paths.split(",") if s.strip()]
+
+        print(f"[ingest] sites_yml={a.sites_yml} sites={len(sites)}")
+
+        for s in sites:
+            # サイト別指定があればそちら優先、なければ共通値
+            site_id = s["site_id"]
+            seed_url = s["seed_url"]
+
+            allowed_paths = s["allowed_paths"] if s["allowed_paths"] else allowed_common
+
+            max_pages = int(s["max_pages"]) if s["max_pages"] is not None else int(a.max_pages)
+            batch_size = int(s["batch_size"]) if s["batch_size"] is not None else int(a.batch_size)
+            sleep_sec = float(s["sleep_sec"]) if s["sleep_sec"] is not None else float(a.sleep_sec)
+            max_chars = int(s["max_chars"]) if s["max_chars"] is not None else int(a.max_chars)
+            overlap = int(s["overlap"]) if s["overlap"] is not None else int(a.overlap)
+            resume_from = int(s["resume_from"]) if s["resume_from"] is not None else a.resume_from
+
+            print("\n==============================")
+            print(f"[site] site_id={site_id}")
+            print(f"[site] seed_url={seed_url}")
+            print(f"[site] allowed_paths={allowed_paths}")
+            print(f"[site] max_pages={max_pages} batch_size={batch_size}")
+            print("==============================")
+
+            run_ingest(
+                site_id=site_id,
+                seed_url=seed_url,
+                max_pages=max_pages,
+                allowed_paths=allowed_paths,
+                batch_size=batch_size,
+                sleep_sec=sleep_sec,
+                max_chars=max_chars,
+                overlap=overlap,
+                resume_from=resume_from,
+                dry_run=a.dry_run,
+            )
+
+        print("\n[ingest] ALL SITES DONE")
+        raise SystemExit(0)
+
+    # 単体モード（従来互換）
+    if a.site_id is None or a.seed_url is None:
+        raise SystemExit("error: --site-id and --seed-url are required unless --sites-yml is provided")
+
     allowed = [s.strip() for s in a.allowed_paths.split(",") if s.strip()]
     run_ingest(
-        site_id=a.site_id,
-        seed_url=a.seed_url,
-        max_pages=a.max_pages,
+        site_id=int(a.site_id),
+        seed_url=str(a.seed_url),
+        max_pages=int(a.max_pages),
         allowed_paths=allowed,
-        batch_size=a.batch_size,
-        sleep_sec=a.sleep_sec,
-        max_chars=a.max_chars,
-        overlap=a.overlap,
+        batch_size=int(a.batch_size),
+        sleep_sec=float(a.sleep_sec),
+        max_chars=int(a.max_chars),
+        overlap=int(a.overlap),
         resume_from=a.resume_from,
         dry_run=a.dry_run,
     )
