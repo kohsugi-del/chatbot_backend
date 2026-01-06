@@ -34,7 +34,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          echo "== repo files =="
+          ls -la
+          echo "== find requirements.txt =="
+          REQ="$(find . -maxdepth 4 -name requirements.txt | head -n 1)"
+          echo "REQ=$REQ"
+          if [ -z "$REQ" ]; then
+            echo "requirements.txt not found"
+            exit 1
+          fi
+          pip install -r "$REQ"
 
       - name: Run ingest
         env:
