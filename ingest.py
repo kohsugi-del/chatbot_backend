@@ -207,20 +207,21 @@ def bfs_crawl(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[s
             continue
         seen.add(u)
 
-        if not is_allowed(u, base_host, allowed_paths):
-            continue
-
-        out.append(u)
-
+        # まず取得してリンク抽出（許可パス外でもOK）
         try:
             r = session.get(u, timeout=TIMEOUT)
-            if r.status_code != 200 or "text/html" not in r.headers.get("Content-Type", ""):
-                continue
-            for link in extract_links(r.text, u):
-                if link not in seen and is_allowed(link, base_host, allowed_paths):
-                    q.append(link)
+            if r.status_code == 200 and "text/html" in r.headers.get("Content-Type", ""):
+                for link in extract_links(r.text, u):
+                    # same-host だけ（allow/denyは後段）
+                    lp = urlparse(link)
+                    if lp.netloc == base_host and link not in seen:
+                        q.append(link)
         except Exception:
-            continue
+            pass
+
+        # documentsに入れるのは allowed のみ
+        if is_allowed(u, base_host, allowed_paths):
+            out.append(u)
 
     return out
 
