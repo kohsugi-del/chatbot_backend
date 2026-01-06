@@ -2,7 +2,7 @@ sites:
   - site_id: 1
     seed_url: "https://hataraku-asahikawa.jp/"
     allowed_paths:
-      - "/columns/"
+      - "/column/"
     max_pages: 50
     batch_size: 5
 
