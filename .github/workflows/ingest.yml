@@ -59,10 +59,20 @@ jobs:
             exit 1
           fi
 
+          echo "== sites.yml =="
+          SITES_YML="$(dirname "$ING")/sites.yml"
+          echo "SITES_YML=$SITES_YML"
+          if [ ! -f "$SITES_YML" ]; then
+            echo "sites.yml not found at $SITES_YML"
+            exit 1
+          fi
+
+          MAX_PAGES="${{ github.event.inputs.max_pages || '50' }}"
+          BATCH_SIZE="${{ github.event.inputs.batch_size || '5' }}"
+
           python "$ING" \
-            --site-id 1 \
-            --seed-url https://hataraku-asahikawa.jp/ \
-            --max-pages 50 \
-            --batch-size 5 \
+            --sites-yml "$SITES_YML" \
+            --max-pages "$MAX_PAGES" \
+            --batch-size "$BATCH_SIZE" \
             --sleep-sec 1
 
