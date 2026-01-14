@@ -1,0 +1,86 @@
+name: Nightly RAG Ingest
+
+on:
+  schedule:
+    - cron: "0 18 * * *"
+
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "Max pages to ingest (common default)"
+        required: false
+        default: "50"
+      batch_size:
+        description: "Batch size (common default)"
+        required: false
+        default: "5"
+      sleep_sec:
+        description: "Sleep seconds"
+        required: false
+        default: "1"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          echo "== repo files =="
+          ls -la
+          echo "== find requirements.txt =="
+          REQ="$(find . -maxdepth 4 -name requirements.txt | head -n 1)"
+          echo "REQ=$REQ"
+          if [ -z "$REQ" ]; then
+            echo "requirements.txt not found"
+            exit 1
+          fi
+          pip install -r "$REQ"
+          # 念のため（sites.ymlを読むため）
+          pip show pyyaml >/dev/null 2>&1 || pip install pyyaml
+
+      - name: Run ingest
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          echo "== find ingest.py =="
+          ING="$(find . -maxdepth 4 -name ingest.py | head -n 1)"
+          echo "ING=$ING"
+          if [ -z "$ING" ]; then
+            echo "ingest.py not found"
+            exit 1
+          fi
+
+          echo "== find sites.yml =="
+          # 1) ingest.pyと同階層、2) repo内どこか、の順に探す
+          SITES_YML="$(dirname "$ING")/sites.yml"
+          if [ ! -f "$SITES_YML" ]; then
+            SITES_YML="$(find . -maxdepth 6 -name sites.yml | head -n 1)"
+          fi
+          echo "SITES_YML=$SITES_YML"
+          if [ -z "$SITES_YML" ] || [ ! -f "$SITES_YML" ]; then
+            echo "sites.yml not found"
+            exit 1
+          fi
+
+          MAX_PAGES="${{ github.event.inputs.max_pages || '50' }}"
+          BATCH_SIZE="${{ github.event.inputs.batch_size || '5' }}"
+          SLEEP_SEC="${{ github.event.inputs.sleep_sec || '1' }}"
+
+          python "$ING" \
+            --sites-yml "$SITES_YML" \
+            --max-pages "$MAX_PAGES" \
+            --batch-size "$BATCH_SIZE" \
+            --sleep-sec "$SLEEP_SEC"

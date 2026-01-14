@@ -11,3 +11,4 @@ langchain-text-splitters
 openai
 numpy
 supabase
+pyyaml
