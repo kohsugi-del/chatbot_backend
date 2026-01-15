@@ -2,18 +2,16 @@
 import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set. Put it in chatbot_backend/.env")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
+# もし postgresql:// のまま来ても psycopg に寄せる
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# もし間違って psycopg2 になってたら psycopg に戻す
+DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql+psycopg://")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
