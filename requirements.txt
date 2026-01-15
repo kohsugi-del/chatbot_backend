@@ -12,3 +12,4 @@ openai
 numpy
 supabase
 pyyaml
+SQLAlchemy>=2.0
