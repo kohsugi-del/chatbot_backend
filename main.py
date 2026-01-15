@@ -24,6 +24,8 @@ from vector_search import search
 # =========================
 app = FastAPI()
 
+log = logging.getLogger("uvicorn.error")
+
 # =========================
 # CORS（※二重に入れない）
 # =========================
@@ -32,6 +34,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        # 本番フロントがあるならここに追加
+        # "https://your-frontend-domain.example",
     ],
     allow_credentials=False,
     allow_methods=["*"],
