@@ -1,9 +1,12 @@
-from pydantic import BaseModel, ConfigDict
+# schemas_file.py
+from pydantic import BaseModel
+from typing import Optional
 
 class FileResponse(BaseModel):
     id: int
     filename: str
-    status: str
-    ingested_chunks: int | None
+    error_message: Optional[str] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        from_attributes = True
+

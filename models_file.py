@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String
+# models_file.py
+from sqlalchemy import Column, Integer, String, Text
 from database import Base
 
 class File(Base):
@@ -6,6 +7,4 @@ class File(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, nullable=False)
-    path = Column(String, nullable=False)
-    status = Column(String, nullable=False, default="pending")
-    ingested_chunks = Column(Integer, nullable=True)
+    error_message = Column(Text, nullable=True)
