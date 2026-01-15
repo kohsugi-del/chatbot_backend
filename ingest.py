@@ -1,7 +1,13 @@
 # ingest.py
 import os, re, time, hashlib, argparse
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import (
+    urljoin,
+    urlparse,
+    urlunparse,
+    parse_qsl,
+    urlencode,
+)
 from datetime import datetime, timezone
 
 import requests
@@ -60,8 +66,11 @@ DENY_PATTERNS = [
     r"/wp-content/",
     r"/wp-json/",
 ]
-DENY_QUERY = True      # ?つきURLは除外
+DENY_QUERY = True      # ?つきURLは除外（normalize_url側でも落とす）
 DENY_FRAGMENT = True   # #付きURLは除外
+
+# ★ クエリを残したい場合は許可キーを追加（例：page, p など）
+ALLOW_QUERY_KEYS = {"page"}
 
 
 # ==============
@@ -74,23 +83,52 @@ def sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 def normalize_url(u: str) -> str:
-    # フラグメントだけ落とす（クエリは残す）
-    u = u.split("#")[0]
-    if u.endswith("/"):
+    """
+    URLの表記ゆれを統一して、visited/重複判定の精度を上げる。
+    - fragment は必ず削除
+    - query は原則削除（ALLOW_QUERY_KEYSだけ残す運用も可）
+    - path 末尾スラッシュを統一（ルート以外は必ず / で終わる）
+    """
+    u = (u or "").strip()
+    if not u:
         return u
-    parsed = urlparse(u)
-    if parsed.path == "":
-        return u + "/"
-    return u
+
+    p = urlparse(u)
+
+    # fragment は必ず落とす
+    frag = ""
+
+    # query は許可キーだけ残す（DENY_QUERY運用でも、ここで落とすとさらに安定）
+    q = ""
+    if p.query:
+        pairs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k in ALLOW_QUERY_KEYS]
+        if pairs:
+            q = urlencode(pairs, doseq=True)
+
+    # path を統一
+    path = p.path or "/"
+    if path != "/" and not path.endswith("/"):
+        path += "/"
+
+    return urlunparse((p.scheme, p.netloc, path, p.params, q, frag))
+
+def _norm_path(path: str) -> str:
+    path = path or "/"
+    if path != "/" and not path.endswith("/"):
+        path += "/"
+    return path
 
 def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
+    """
+    allowed_paths とURLの末尾 / 揺れで落ちないように、両方正規化して比較する。
+    """
     p = urlparse(url)
 
     # ドメインチェック
     if p.netloc != base_host:
         return False
 
-    # クエリ除外
+    # クエリ除外（normalize_urlで落としているが念のため）
     if DENY_QUERY and p.query:
         return False
 
@@ -98,7 +136,7 @@ def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
     if DENY_FRAGMENT and p.fragment:
         return False
 
-    path = p.path or "/"
+    path = _norm_path(p.path)
 
     # deny パターン
     for pat in DENY_PATTERNS:
@@ -108,7 +146,9 @@ def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
     # allow 判定
     if not allowed_paths:
         return True
-    return any(path.startswith(ap) for ap in allowed_paths)
+
+    allowed_norm = [_norm_path(str(ap).strip()) for ap in allowed_paths if ap and str(ap).strip()]
+    return any(path.startswith(ap) for ap in allowed_norm)
 
 def extract_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -119,7 +159,8 @@ def extract_links(html: str, base_url: str) -> list[str]:
             continue
         absu = urljoin(base_url, href)
         absu = normalize_url(absu)
-        links.append(absu)
+        if absu:
+            links.append(absu)
     return links
 
 def extract_text(html: str) -> tuple[str, str]:
@@ -136,6 +177,14 @@ def extract_text(html: str) -> tuple[str, str]:
 
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return title, text
+
+def normalize_text_for_hash(text: str) -> str:
+    # 空白・改行ゆれを潰してハッシュを安定化
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+def make_page_hash(title: str, text: str) -> str:
+    base = (title or "") + "\n" + normalize_text_for_hash(text)
+    return sha1(base)
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
     chunks = []
@@ -191,29 +240,115 @@ def upsert_documents(rows: list[dict]):
 
 
 # ==============
+# Supabase: page fingerprints（★同一内容の再取り込み防止）
+# ==============
+# 事前に Supabase に page_fingerprints テーブルを作ってください（推奨）
+# - site_id (int)
+# - url (text)
+# - page_hash (text)
+# - updated_at (timestamptz)
+# - UNIQUE(site_id, url)
+def fingerprint_get(site_id: int, url: str) -> str | None:
+    try:
+        r = supabase.table("page_fingerprints").select("page_hash").eq("site_id", site_id).eq("url", url).execute()
+        if r.data:
+            return r.data[0].get("page_hash")
+    except Exception:
+        # テーブル未作成などでも ingest 自体は進めたい
+        return None
+    return None
+
+def fingerprint_upsert(site_id: int, url: str, page_hash: str):
+    try:
+        supabase.table("page_fingerprints").upsert({
+            "site_id": site_id,
+            "url": url,
+            "page_hash": page_hash,
+            "updated_at": now_iso(),
+        }, on_conflict="site_id,url").execute()
+    except Exception:
+        # テーブル未作成などでも ingest 自体は進めたい
+        pass
+
+
+# ==============
 # Crawl: sitemap優先 → 無ければ簡易BFS
 # ==============
 def fetch_sitemap_urls(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[str]:
+    """
+    sitemap.xml / sitemap_index.xml / wp-sitemap.xml を試し、
+    <urlset> と <sitemapindex> の両方に対応する。
+    """
     parsed = urlparse(seed_url)
-    sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
-    try:
-        r = session.get(sitemap_url, timeout=TIMEOUT)
-        r.encoding = r.apparent_encoding
-        if r.status_code != 200 or "<urlset" not in r.text:
-            return []
-        soup = BeautifulSoup(r.text, "xml")
-        locs = [loc.get_text(strip=True) for loc in soup.select("url > loc")]
-        base_host = parsed.netloc
-        urls = []
-        for u in locs:
-            u = normalize_url(u)
-            if is_allowed(u, base_host, allowed_paths):
-                urls.append(u)
-            if len(urls) >= max_pages:
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    base_host = parsed.netloc
+
+    candidates = [
+        f"{base}/sitemap.xml",
+        f"{base}/sitemap_index.xml",
+        f"{base}/wp-sitemap.xml",
+    ]
+
+    collected: list[str] = []
+    seen: set[str] = set()
+
+    def add_url(u: str):
+        nonlocal collected
+        u = normalize_url(u)
+        if not u or u in seen:
+            return
+        if is_allowed(u, base_host, allowed_paths):
+            seen.add(u)
+            collected.append(u)
+
+    def parse_urlset(xml_text: str):
+        soup = BeautifulSoup(xml_text, "xml")
+        for loc in soup.select("url > loc"):
+            add_url(loc.get_text(strip=True))
+            if len(collected) >= max_pages:
                 break
-        return urls
-    except Exception:
-        return []
+
+    def parse_sitemapindex(xml_text: str):
+        soup = BeautifulSoup(xml_text, "xml")
+        locs = [x.get_text(strip=True) for x in soup.select("sitemap > loc")]
+        for sm in locs:
+            if len(collected) >= max_pages:
+                break
+            try:
+                rr = session.get(sm, timeout=TIMEOUT)
+                rr.encoding = rr.apparent_encoding
+                if rr.status_code != 200:
+                    continue
+                text_ = rr.text
+                # ネストindexにも対応
+                if "<sitemapindex" in text_:
+                    parse_sitemapindex(text_)
+                if "<urlset" in text_:
+                    parse_urlset(text_)
+            except Exception:
+                continue
+
+    for sm_url in candidates:
+        try:
+            r = session.get(sm_url, timeout=TIMEOUT)
+            r.encoding = r.apparent_encoding
+            if r.status_code != 200:
+                continue
+
+            text_ = r.text
+            if "<sitemapindex" in text_:
+                parse_sitemapindex(text_)
+                if collected:
+                    return collected[:max_pages]
+            if "<urlset" in text_:
+                parse_urlset(text_)
+                if collected:
+                    return collected[:max_pages]
+
+        except Exception:
+            continue
+
+    return []
 
 def bfs_crawl(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[str]:
     parsed = urlparse(seed_url)
@@ -225,6 +360,8 @@ def bfs_crawl(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[s
 
     while q and len(out) < max_pages:
         u = q.pop(0)
+        if not u:
+            continue
         if u in seen:
             continue
         seen.add(u)
@@ -351,7 +488,7 @@ def run_ingest(
 
     # URLs決定
     if urls_override is not None:
-        urls = urls_override
+        urls = [normalize_url(u) for u in urls_override if normalize_url(u)]
     else:
         urls = fetch_sitemap_urls(seed_url, allowed_paths, max_pages)
         if not urls:
@@ -381,6 +518,10 @@ def run_ingest(
         docs = []
         for u in batch_urls:
             try:
+                u = normalize_url(u)
+                if not u:
+                    continue
+
                 state_update(site_id, last_url=u)
                 r = session.get(u, timeout=TIMEOUT)
                 r.encoding = r.apparent_encoding  # ★文字化け防止
@@ -397,12 +538,20 @@ def run_ingest(
                     print(f"  - skip {u} (too short)")
                     continue
 
+                # ★ content_hash（ページ本文）で「同一内容ならスキップ」
+                page_hash = make_page_hash(title, text)
+                prev = fingerprint_get(site_id, u)
+                if prev is not None and prev == page_hash:
+                    print(f"  - skip {u} (unchanged)")
+                    continue
+
                 chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
                 if not chunks:
                     print(f"  - skip {u} (no chunks)")
                     continue
 
-                docs.append((u, title, chunks))
+                # docsに page_hash も持たせる
+                docs.append((u, title, chunks, page_hash))
                 print(f"  + ok {u} chunks={len(chunks)}")
 
             except Exception as e:
@@ -413,10 +562,12 @@ def run_ingest(
         rows = []
         embed_inputs = []
         meta = []
+        url_to_page_hash: dict[str, str] = {}
 
-        for (u, title, chunks) in docs:
+        for (u, title, chunks, page_hash) in docs:
+            url_to_page_hash[u] = page_hash
             for i, c in enumerate(chunks):
-                h = sha1(c)
+                h = sha1(c)  # chunk_hash（既存互換：必要なら後で使える）
                 embed_inputs.append(c)
                 meta.append((u, title, i, c, h))
 
@@ -441,6 +592,10 @@ def run_ingest(
 
                 # docs の件数 = “本文抽出できたURL数”
                 ingested_urls_count += len(docs)
+
+                # ★ fingerprint（page_hash）を更新（成功したURLのみ）
+                for (u, _title, _chunks, _page_hash) in docs:
+                    fingerprint_upsert(site_id, u, _page_hash)
 
                 print(f"[db] upserted {len(rows)} chunks (urls_ok={len(docs)})")
 
@@ -479,7 +634,8 @@ def derive_allowed_from_scope(seed_url: str, scope: str | None) -> tuple[list[st
         return ([], 1, [normalize_url(seed_url)])
 
     if scope == "subtree":
-        ap = path if path.endswith("/") else (path.rsplit("/", 1)[0] + "/")
+        # seed_url が /diversity/ のときは /diversity/ 配下へ
+        ap = _norm_path(path)
         return ([ap], None, None)
 
     # default: no restriction
