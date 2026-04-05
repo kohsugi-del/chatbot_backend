@@ -11,7 +11,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import os, shutil, re, uuid
+import os, shutil, re, uuid, logging
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -312,16 +312,28 @@ def reingest_local(site_id: int, background_tasks: BackgroundTasks, db: Session 
     def task(site_id_: int):
         db2 = SessionLocal()
         try:
+            # ★最低限の可視化（開始ログ）
+            log.info(f"[ingest] start site_id={site_id_}")
+
             # 実処理（ここで例外が出ると except へ）
-            ingest_site_from_db(site_id_)
+            log.info(f"[ingest] calling ingest_site_from_db site_id={site_id_}")
+            ingest_site_from_db(site_id_, max_pages=50, batch_size=5, sleep_sec=0.2, dry_run=False)
+            log.info(f"[ingest] returned ingest_site_from_db site_id={site_id_}")
+
+            # ★最低限の可視化（完了ログ）
+            log.info(f"[ingest] done site_id={site_id_}")
 
             # 成功にする
             _set_site_status(db2, site_id_, "done", None)
 
         except Exception as e:
+            # ★最低限の可視化（例外ログ：traceback付き）
+            log.exception(f"[ingest] error site_id={site_id_}")
+
             # 失敗にする（Site に error_message があるなら入る）
             _set_site_status(db2, site_id_, "error", f"{type(e).__name__}: {e}")
-            # 例外はログに残る（uvicorn側にTracebackが出る）
+
+            # 例外はuvicorn側にTracebackが出る
             raise
         finally:
             db2.close()

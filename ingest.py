@@ -1,5 +1,5 @@
 # ingest.py
-import os, re, time, hashlib, argparse
+import os, re, time, hashlib, argparse, logging
 from pathlib import Path
 from urllib.parse import (
     urljoin,
@@ -34,6 +34,10 @@ from sqlalchemy import create_engine, text
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
+# ★ connect/read を分離（環境変数が無い場合は TIMEOUT から決める）
+TIMEOUT_CONNECT = int(os.getenv("HTTP_TIMEOUT_CONNECT", str(min(5, max(1, TIMEOUT // 4)))))
+TIMEOUT_READ = int(os.getenv("HTTP_TIMEOUT_READ", str(max(8, TIMEOUT))))
+
 UA = os.getenv(
     "INGEST_UA",
     "Mozilla/5.0 (compatible; QwestIngestBot/1.0; +https://qwest.co.jp)"
@@ -58,7 +62,18 @@ supabase: Client = create_client(
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
 
-# ===== 共通フィルタ設定（必要なら env で調整してもOK） =====
+# ★ FastAPI(uvicorn) のログに寄せる（BackgroundTasksでも追いやすい）
+log = logging.getLogger("uvicorn")
+log.setLevel(logging.INFO)
+
+# ★ 単体実行（python ingest.py）でもログが出るように保険
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+# ===== 共通フィルタ設定 =====
 DENY_PATTERNS = [
     r"/page/\d+/?$",   # ページネーション
     r"/tag/",
@@ -66,11 +81,13 @@ DENY_PATTERNS = [
     r"/wp-content/",
     r"/wp-json/",
 ]
-DENY_QUERY = True      # ?つきURLは除外（normalize_url側でも落とす）
+DENY_QUERY = True      # 既定は ? 付きURLを除外（※ /plus/ 配下のみ例外で許可）
 DENY_FRAGMENT = True   # #付きURLは除外
 
-# ★ クエリを残したい場合は許可キーを追加（例：page, p など）
-ALLOW_QUERY_KEYS = {"page"}
+
+# ★ クエリを残したい場合は許可キーを追加
+# /plus/ 配下は query が実体なので、ここが超重要
+ALLOW_QUERY_KEYS = {"page", "app_controller", "id", "type", "run"}
 
 
 # ==============
@@ -82,12 +99,42 @@ def now_iso() -> str:
 def sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
+def _norm_host(h: str) -> str:
+    """www差を無視してホスト比較できるようにする"""
+    h = (h or "").strip().lower()
+    if h.startswith("www."):
+        h = h[4:]
+    return h
+
+def _looks_like_file(path: str) -> bool:
+    """末尾が .php .html .pdf などの “ファイル” に見えるか"""
+    return bool(re.search(r"\.[a-zA-Z0-9]{1,6}$", path or ""))
+
+def ensure_plus_search_run(u: str) -> str:
+    """/plus/ search URL を run=true 付きに正規化する"""
+    p = urlparse(u)
+    if not (p.path or "").startswith("/plus/"):
+        return u
+
+    qd = dict(parse_qsl(p.query, keep_blank_values=True))
+    if qd.get("app_controller") != "search":
+        return u
+
+    # run=true を強制
+    qd["run"] = "true"
+
+    # なるべく無限増殖を避けたいので、page が無ければ 1 を入れる（任意）
+    # qd.setdefault("page", "1")
+
+    q = urlencode(sorted(qd.items()), doseq=True)
+    return normalize_url(urlunparse((p.scheme, p.netloc, p.path, p.params, q, "")))
+
 def normalize_url(u: str) -> str:
     """
     URLの表記ゆれを統一して、visited/重複判定の精度を上げる。
     - fragment は必ず削除
-    - query は原則削除（ALLOW_QUERY_KEYSだけ残す運用も可）
-    - path 末尾スラッシュを統一（ルート以外は必ず / で終わる）
+    - query は原則削除（ALLOW_QUERY_KEYSだけ残す）
+    - path 末尾スラッシュを統一（ただし .php 等の “ファイル” は付けない）
     """
     u = (u or "").strip()
     if not u:
@@ -98,43 +145,65 @@ def normalize_url(u: str) -> str:
     # fragment は必ず落とす
     frag = ""
 
-    # query は許可キーだけ残す（DENY_QUERY運用でも、ここで落とすとさらに安定）
+    # query は許可キーだけ残す
     q = ""
     if p.query:
-        pairs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k in ALLOW_QUERY_KEYS]
+        pairs = [
+            (k, v)
+            for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if k in ALLOW_QUERY_KEYS
+        ]
         if pairs:
             q = urlencode(pairs, doseq=True)
 
     # path を統一
     path = p.path or "/"
-    if path != "/" and not path.endswith("/"):
+    if path != "/" and (not _looks_like_file(path)) and (not path.endswith("/")):
         path += "/"
 
     return urlunparse((p.scheme, p.netloc, path, p.params, q, frag))
 
 def _norm_path(path: str) -> str:
+    """allowed_paths 側も正規化（ファイルっぽいものは末尾/を付けない）"""
     path = path or "/"
-    if path != "/" and not path.endswith("/"):
+    if path != "/" and (not _looks_like_file(path)) and (not path.endswith("/")):
         path += "/"
     return path
 
 def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
     """
     allowed_paths とURLの末尾 / 揺れで落ちないように、両方正規化して比較する。
+    - ★ /plus/ 配下は query を許可（ただし info&id のみ許可）
     """
     p = urlparse(url)
 
-    # ドメインチェック
-    if p.netloc != base_host:
+    # ドメインチェック（★www差を無視）
+    if _norm_host(p.netloc) != _norm_host(base_host):
         return False
 
-    # クエリ除外（normalize_urlで落としているが念のため）
-    if DENY_QUERY and p.query:
-        return False
-
-    # フラグメント除外（normalize_urlで落としているが念のため）
+    # フラグメント除外
     if DENY_FRAGMENT and p.fragment:
         return False
+
+    # ★ /plus/ 配下は query を許可、それ以外はDENY_QUERYなら落とす
+    if DENY_QUERY and p.query and (not (p.path or "").startswith("/plus/")):
+        return False
+
+     # ★ /plus/ は info&id のみ許可（クエリ無しの /plus/ や login.php は除外）
+    if (p.path or "").startswith("/plus/"):
+        # loginは除外
+        if (p.path or "").endswith("/plus/login.php"):
+            return False
+
+        # queryが無い /plus/ 系は除外（入口ページまで入れたいなら True にしてもOK）
+        if not p.query:
+            return False
+
+        qd = dict(parse_qsl(p.query, keep_blank_values=True))
+        if qd.get("app_controller") != "info":
+            return False
+        if "id" not in qd:
+            return False
 
     path = _norm_path(p.path)
 
@@ -179,7 +248,6 @@ def extract_text(html: str) -> tuple[str, str]:
     return title, text
 
 def normalize_text_for_hash(text: str) -> str:
-    # 空白・改行ゆれを潰してハッシュを安定化
     return re.sub(r"\s+", " ", (text or "").strip())
 
 def make_page_hash(title: str, text: str) -> str:
@@ -242,32 +310,33 @@ def upsert_documents(rows: list[dict]):
 # ==============
 # Supabase: page fingerprints（★同一内容の再取り込み防止）
 # ==============
-# 事前に Supabase に page_fingerprints テーブルを作ってください（推奨）
-# - site_id (int)
-# - url (text)
-# - page_hash (text)
-# - updated_at (timestamptz)
-# - UNIQUE(site_id, url)
 def fingerprint_get(site_id: int, url: str) -> str | None:
     try:
-        r = supabase.table("page_fingerprints").select("page_hash").eq("site_id", site_id).eq("url", url).execute()
+        r = (
+            supabase.table("page_fingerprints")
+            .select("page_hash")
+            .eq("site_id", site_id)
+            .eq("url", url)
+            .execute()
+        )
         if r.data:
             return r.data[0].get("page_hash")
     except Exception:
-        # テーブル未作成などでも ingest 自体は進めたい
         return None
     return None
 
 def fingerprint_upsert(site_id: int, url: str, page_hash: str):
     try:
-        supabase.table("page_fingerprints").upsert({
-            "site_id": site_id,
-            "url": url,
-            "page_hash": page_hash,
-            "updated_at": now_iso(),
-        }, on_conflict="site_id,url").execute()
+        supabase.table("page_fingerprints").upsert(
+            {
+                "site_id": site_id,
+                "url": url,
+                "page_hash": page_hash,
+                "updated_at": now_iso(),
+            },
+            on_conflict="site_id,url",
+        ).execute()
     except Exception:
-        # テーブル未作成などでも ingest 自体は進めたい
         pass
 
 
@@ -275,10 +344,6 @@ def fingerprint_upsert(site_id: int, url: str, page_hash: str):
 # Crawl: sitemap優先 → 無ければ簡易BFS
 # ==============
 def fetch_sitemap_urls(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[str]:
-    """
-    sitemap.xml / sitemap_index.xml / wp-sitemap.xml を試し、
-    <urlset> と <sitemapindex> の両方に対応する。
-    """
     parsed = urlparse(seed_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     base_host = parsed.netloc
@@ -315,22 +380,21 @@ def fetch_sitemap_urls(seed_url: str, allowed_paths: list[str], max_pages: int) 
             if len(collected) >= max_pages:
                 break
             try:
-                rr = session.get(sm, timeout=TIMEOUT)
+                rr = session.get(sm, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
                 rr.encoding = rr.apparent_encoding
                 if rr.status_code != 200:
                     continue
                 text_ = rr.text
-                # ネストindexにも対応
                 if "<sitemapindex" in text_:
                     parse_sitemapindex(text_)
                 if "<urlset" in text_:
                     parse_urlset(text_)
-            except Exception:
+            except requests.exceptions.RequestException:
                 continue
 
     for sm_url in candidates:
         try:
-            r = session.get(sm_url, timeout=TIMEOUT)
+            r = session.get(sm_url, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
             r.encoding = r.apparent_encoding
             if r.status_code != 200:
                 continue
@@ -344,39 +408,115 @@ def fetch_sitemap_urls(seed_url: str, allowed_paths: list[str], max_pages: int) 
                 parse_urlset(text_)
                 if collected:
                     return collected[:max_pages]
-
-        except Exception:
+        except requests.exceptions.RequestException:
             continue
 
-    return []
+def _is_plus_path(u: str) -> bool:
+    return (urlparse(u).path or "").startswith("/plus/")
+
+def _is_plus_search(u: str) -> bool:
+    p = urlparse(u)
+    if not (p.path or "").startswith("/plus/"):
+        return False
+    qd = dict(parse_qsl(p.query, keep_blank_values=True))
+    return qd.get("app_controller") == "search"
+
+def _is_plus_info(u: str) -> bool:
+    p = urlparse(u)
+    if not (p.path or "").startswith("/plus/"):
+        return False
+    qd = dict(parse_qsl(p.query, keep_blank_values=True))
+    return qd.get("app_controller") == "info" and ("id" in qd)
 
 def bfs_crawl(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[str]:
     parsed = urlparse(seed_url)
     base_host = parsed.netloc
 
+    # ★ 追加：seed が /plus/ かどうか（1回だけ判定して使い回す）
+    seed_is_plus = (urlparse(seed_url).path or "").startswith("/plus/")
+
     q = [normalize_url(seed_url)]
-    seen = set()
-    out = []
+    seen: set[str] = set()
+    out: list[str] = []
 
     while q and len(out) < max_pages:
         u = q.pop(0)
-        if not u:
-            continue
-        if u in seen:
+        if not u or u in seen:
             continue
         seen.add(u)
 
-        # まず取得してリンク抽出（許可パス外でもOK）
         try:
-            r = session.get(u, timeout=TIMEOUT)
-            r.encoding = r.apparent_encoding  # ★文字化け防止
-            if r.status_code == 200 and "text/html" in r.headers.get("Content-Type", ""):
-                for link in extract_links(r.text, u):
+            log.info(f"[bfs][GET] {u}")
+            r = session.get(u, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+            r.encoding = r.apparent_encoding
+            ct = (r.headers.get("Content-Type") or "").lower()
+
+            if r.status_code == 200 and (("text/html" in ct) or ("application/xhtml+xml" in ct)):
+                links = extract_links(r.text, u)
+
+                # =========================
+                # ★ /plus/ の挙動を特殊化
+                # - search は「中身を見るだけ」
+                # - search からは info だけをキューに積む
+                # - search 自体は out に入れない
+                # =========================
+                if _is_plus_search(u):
+                    for link in links:
+                        lp = urlparse(link)
+
+                        # 同一ドメインのみ
+                        if _norm_host(lp.netloc) != _norm_host(base_host):
+                            continue
+                        if link in seen:
+                            continue
+
+                        # ★ 追加：seed が /plus/ の時は /plus/ 外へ脱線しない
+                        if seed_is_plus and not (lp.path or "").startswith("/plus/"):
+                            continue
+
+                        # searchページは増殖させない（page=2 等に行かない）
+                        if _is_plus_search(link):
+                            # search は増殖しやすいので「run=true の1種類」だけ許す
+                            q.append(ensure_plus_search_run(link))
+                            continue
+
+                        # info だけ許可してキューへ
+                        if _is_plus_info(link):
+                            q.append(link)
+
+                    # search は out に入れない
+                    continue
+
+                # =========================
+                # 通常の挙動：辿るURLも is_allowed で絞る
+                # =========================
+                for link in links:
                     lp = urlparse(link)
-                    if lp.netloc == base_host and link not in seen:
-                        q.append(link)
-        except Exception:
-            pass
+
+                    # 同一ドメインのみ
+                    if _norm_host(lp.netloc) != _norm_host(base_host):
+                        continue
+                    if link in seen:
+                        continue
+
+                    # ★ 追加：seed が /plus/ の時は /plus/ 外へ脱線しない
+                    if seed_is_plus and not (lp.path or "").startswith("/plus/"):
+                        continue
+
+                    # /plus/ search は「見るだけ」なので、キューには積む（1回だけ）
+                    if _is_plus_search(link):
+                        q.append(ensure_plus_search_run(link))
+                        continue
+
+                    # それ以外は is_allowed を通す
+                    if not is_allowed(link, base_host, allowed_paths):
+                        continue
+
+                    q.append(link)
+
+        except requests.exceptions.RequestException as e:
+            log.info(f"  - bfs skip {u} ({type(e).__name__})")
+            continue
 
         # documentsに入れるのは allowed のみ
         if is_allowed(u, base_host, allowed_paths):
@@ -385,15 +525,13 @@ def bfs_crawl(seed_url: str, allowed_paths: list[str], max_pages: int) -> list[s
     return out
 
 
+
 # ==============
 # DB（sitesテーブル）操作：status更新
 # ==============
 def db_engine_from_env():
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is required for --from-db mode (and for updating sites.status).")
-    connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
-    return create_engine(db_url, pool_pre_ping=True, connect_args=connect_args)
+    from database import engine
+    return engine
 
 def set_site_status(
     engine,
@@ -402,20 +540,14 @@ def set_site_status(
     last_error: str | None = None,
     ingested_urls: int | None = None,
 ):
-    """
-    sites テーブルに status / last_error / ingested_urls を書く。
-    カラムが無い可能性があるので、できるだけ安全に更新する。
-    """
     status = str(status)
 
-    # まず status だけ必ず更新
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE sites SET status=:st WHERE id=:id"),
             {"st": status, "id": site_id},
         )
 
-    # last_error 追記（あれば）
     if last_error is not None:
         with engine.begin() as conn:
             try:
@@ -426,7 +558,6 @@ def set_site_status(
             except Exception:
                 pass
 
-    # ingested_urls 追記（あれば）
     if ingested_urls is not None:
         with engine.begin() as conn:
             try:
@@ -445,7 +576,10 @@ def fetch_sites_from_db(engine, limit: int, only_site_id: int | None, pending_on
         return [row] if row else []
 
     if pending_only:
-        q = text("SELECT id, url, scope, type, status FROM sites WHERE status='pending' ORDER BY id ASC LIMIT :lim")
+        q = text(
+            "SELECT id, url, scope, type, status "
+            "FROM sites WHERE status='pending' ORDER BY id ASC LIMIT :lim"
+        )
     else:
         q = text("SELECT id, url, scope, type, status FROM sites ORDER BY id ASC LIMIT :lim")
 
@@ -470,15 +604,6 @@ def run_ingest(
     dry_run: bool,
     urls_override: list[str] | None = None,
 ) -> dict:
-    """
-    戻り値:
-      {
-        "site_id": int,
-        "total_urls": int,
-        "ingested_urls": int,  # 実際に本文抽出できたURL数
-        "chunks_upserted": int,
-      }
-    """
     st = state_get(site_id)
 
     if resume_from is not None:
@@ -486,34 +611,61 @@ def run_ingest(
 
     state_update(site_id, status="running", last_error=None)
 
+    # ★ /plus/ の時は探索・取り込み対象を /plus/ 配下に固定（脱線防止）
+    if (urlparse(seed_url).path or "").startswith("/plus/"):
+        if not allowed_paths:
+            allowed_paths = ["/plus/"]
+            log.info("[plus] force allowed_paths=['/plus/']")
+
     # URLs決定
     if urls_override is not None:
         urls = [normalize_url(u) for u in urls_override if normalize_url(u)]
+        crawl_mode = "override"
     else:
-        urls = fetch_sitemap_urls(seed_url, allowed_paths, max_pages)
-        if not urls:
+        # ★ /plus/ は sitemap が役に立たない（クエリ詳細が載らない）ので BFS 強制
+        if (urlparse(seed_url).path or "").startswith("/plus/"):
+            crawl_mode = "bfs"
             urls = bfs_crawl(seed_url, allowed_paths, max_pages)
+        else:
+            urls = fetch_sitemap_urls(seed_url, allowed_paths, max_pages)
+            if urls:
+                crawl_mode = "sitemap"
+            else:
+                crawl_mode = "bfs"
+                urls = bfs_crawl(seed_url, allowed_paths, max_pages)
 
     total = len(urls)
     state_update(site_id, total=total)
 
+    # ★ dry-runでも「収集できてるか」必ず見えるように
+    log.info(f"[crawl] mode={crawl_mode} collected={total} (max_pages={max_pages})")
+
     if total == 0:
         state_update(site_id, status="failed", last_error="No URLs found.")
+        if (urlparse(seed_url).path or "").startswith("/plus/"):
+            log.info("[plus] No URLs found (info links not detected). End without raising.")
+            return {
+                "site_id": site_id,
+                "total_urls": 0,
+                "ingested_urls": 0,
+                "chunks_upserted": 0,
+            }
         raise RuntimeError("No URLs found. Check seed_url / allowed_paths.")
 
     cursor = int(st.get("cursor", 0))
     cursor = min(max(cursor, 0), total)
 
-    print(f"[ingest] site_id={site_id} total={total} cursor={cursor}")
-    print(f"[ingest] seed_url={seed_url}")
-    print(f"[ingest] allowed_paths={allowed_paths} max_pages={max_pages} batch={batch_size}")
+    log.info(f"[ingest] site_id={site_id} total={total} cursor={cursor}")
+    log.info(f"[ingest] seed_url={seed_url}")
+    log.info(f"[ingest] allowed_paths={allowed_paths} batch={batch_size}")
+    log.info(f"[ingest] timeout(connect,read)=({TIMEOUT_CONNECT},{TIMEOUT_READ}) dry_run={dry_run}")
 
     ingested_urls_count = 0
     chunks_upserted_total = 0
 
     while cursor < total:
         batch_urls = urls[cursor: cursor + batch_size]
-        print(f"\n[batch] cursor={cursor} -> {cursor + len(batch_urls) - 1}")
+        log.info(f"[batch] cursor={cursor} -> {cursor + len(batch_urls) - 1}")
 
         docs = []
         for u in batch_urls:
@@ -523,60 +675,62 @@ def run_ingest(
                     continue
 
                 state_update(site_id, last_url=u)
-                r = session.get(u, timeout=TIMEOUT)
-                r.encoding = r.apparent_encoding  # ★文字化け防止
+
+                # ★ どこで止まりやすいか分かるように（必要ならコメントアウトOK）
+                log.info(f"  [GET] {u}")
+
+                r = session.get(u, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+                r.encoding = r.apparent_encoding
 
                 if r.status_code != 200:
-                    print(f"  - skip {u} status={r.status_code}")
-                    continue
-                if "text/html" not in r.headers.get("Content-Type", ""):
-                    print(f"  - skip {u} content-type={r.headers.get('Content-Type')}")
+                    log.info(f"  - skip {u} status={r.status_code}")
                     continue
 
-                title, text = extract_text(r.text)
-                if len(text) < 50:
-                    print(f"  - skip {u} (too short)")
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if ("text/html" not in ct) and ("application/xhtml+xml" not in ct):
+                    log.info(f"  - skip {u} content-type={ct}")
                     continue
 
-                # ★ content_hash（ページ本文）で「同一内容ならスキップ」
-                page_hash = make_page_hash(title, text)
+                title, text_ = extract_text(r.text)
+                if len(text_) < 50:
+                    log.info(f"  - skip {u} (too short)")
+                    continue
+
+                page_hash = make_page_hash(title, text_)
                 prev = fingerprint_get(site_id, u)
                 if prev is not None and prev == page_hash:
-                    print(f"  - skip {u} (unchanged)")
+                    log.info(f"  - skip {u} (unchanged)")
                     continue
 
-                chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
+                chunks = chunk_text(text_, max_chars=max_chars, overlap=overlap)
                 if not chunks:
-                    print(f"  - skip {u} (no chunks)")
+                    log.info(f"  - skip {u} (no chunks)")
                     continue
 
-                # docsに page_hash も持たせる
                 docs.append((u, title, chunks, page_hash))
-                print(f"  + ok {u} chunks={len(chunks)}")
+                log.info(f"  + ok {u} chunks={len(chunks)}")
 
             except Exception as e:
-                print(f"  ! error {u}: {e}")
+                log.exception(f"  ! error {u}: {e}")
                 state_update(site_id, last_error=str(e))
                 continue
 
         rows = []
         embed_inputs = []
         meta = []
-        url_to_page_hash: dict[str, str] = {}
 
         for (u, title, chunks, page_hash) in docs:
-            url_to_page_hash[u] = page_hash
             for i, c in enumerate(chunks):
-                h = sha1(c)  # chunk_hash（既存互換：必要なら後で使える）
+                h = sha1(c)
                 embed_inputs.append(c)
-                meta.append((u, title, i, c, h))
+                meta.append((u, title, i, c, h, page_hash))
 
         if embed_inputs:
             if dry_run:
-                print(f"[dry-run] would embed {len(embed_inputs)} chunks")
+                log.info(f"[dry-run] would embed {len(embed_inputs)} chunks (urls_ok={len(docs)})")
             else:
                 vectors = embed_texts(embed_inputs)
-                for (u, title, idx, c, h), v in zip(meta, vectors):
+                for (u, title, idx, c, h, page_hash), v in zip(meta, vectors):
                     rows.append({
                         "site_id": site_id,
                         "url": u,
@@ -589,15 +743,12 @@ def run_ingest(
 
                 upsert_documents(rows)
                 chunks_upserted_total += len(rows)
-
-                # docs の件数 = “本文抽出できたURL数”
                 ingested_urls_count += len(docs)
 
-                # ★ fingerprint（page_hash）を更新（成功したURLのみ）
                 for (u, _title, _chunks, _page_hash) in docs:
                     fingerprint_upsert(site_id, u, _page_hash)
 
-                print(f"[db] upserted {len(rows)} chunks (urls_ok={len(docs)})")
+                log.info(f"[db] upserted {len(rows)} chunks (urls_ok={len(docs)})")
 
         cursor += batch_size
         state_update(site_id, cursor=min(cursor, total))
@@ -606,7 +757,7 @@ def run_ingest(
             time.sleep(sleep_sec)
 
     state_update(site_id, status="done", last_error=None)
-    print("\n[ingest] DONE")
+    log.info("[ingest] DONE")
 
     return {
         "site_id": site_id,
@@ -622,7 +773,7 @@ def run_ingest(
 def derive_allowed_from_scope(seed_url: str, scope: str | None) -> tuple[list[str], int | None, list[str] | None]:
     """
     sites.scope から allowed_paths / max_pages / urls_override を決める
-    - single: 指定URL1件だけ（urls_overrideを使う）
+    - single: 指定URL1件だけ
     - subtree: seed_url の path 配下に制限
     - other: 制限なし
     """
@@ -634,11 +785,9 @@ def derive_allowed_from_scope(seed_url: str, scope: str | None) -> tuple[list[st
         return ([], 1, [normalize_url(seed_url)])
 
     if scope == "subtree":
-        # seed_url が /diversity/ のときは /diversity/ 配下へ
         ap = _norm_path(path)
         return ([ap], None, None)
 
-    # default: no restriction
     return ([], None, None)
 
 
@@ -648,23 +797,13 @@ def derive_allowed_from_scope(seed_url: str, scope: str | None) -> tuple[list[st
 def ingest_site_from_db(
     site_id: int,
     *,
-    max_pages: int = 300,
-    batch_size: int = 10,
-    sleep_sec: float = 1.0,
-    max_chars: int = 2500,
-    overlap: int = 250,
+    max_pages: int = 120,
+    batch_size: int = 8,
+    sleep_sec=0.1,
+    max_chars=4500,
+    overlap: int = 80,
     dry_run: bool = False,
 ) -> dict:
-    """
-    FastAPI から:
-      from ingest import ingest_site_from_db
-      ingest_site_from_db(site_id=1)
-    のように呼べる。
-
-    - sites テーブルから url/scope を読む
-    - status を crawling にする（フロントと合わせる）
-    - 完了時に done + ingested_urls を反映
-    """
     eng = db_engine_from_env()
 
     rows = fetch_sites_from_db(eng, limit=1, only_site_id=site_id, pending_only=False)
@@ -676,10 +815,8 @@ def ingest_site_from_db(
     scope = r.get("scope")
 
     allowed_paths_from_scope, max_pages_override, urls_override = derive_allowed_from_scope(seed_url, scope)
-
     mp = int(max_pages_override) if max_pages_override is not None else int(max_pages)
 
-    # ★ フロント想定の status に合わせる
     set_site_status(eng, site_id, "crawling", last_error=None)
 
     try:
@@ -692,7 +829,7 @@ def ingest_site_from_db(
             sleep_sec=float(sleep_sec),
             max_chars=int(max_chars),
             overlap=int(overlap),
-            resume_from=0,  # API起動は基本リスタート
+            resume_from=0,
             dry_run=bool(dry_run),
             urls_override=urls_override,
         )
@@ -763,19 +900,15 @@ def load_sites_yml(path: str) -> list[dict]:
 def parse_args():
     p = argparse.ArgumentParser()
 
-    # ★ DB（sitesテーブル）から pending を拾う
     p.add_argument("--from-db", action="store_true", help="Ingest pending sites from DB (sites table)")
     p.add_argument("--limit", type=int, default=20, help="How many pending sites to process in one run")
     p.add_argument("--only-site-id", type=int, default=None, help="Process only this site_id (from sites table)")
 
-    # 複数サイト実行（従来）
     p.add_argument("--sites-yml", type=str, default="")
 
-    # 単体実行（従来）
     p.add_argument("--site-id", type=int)
     p.add_argument("--seed-url", type=str)
 
-    # 共通オプション
     p.add_argument("--max-pages", type=int, default=300)
     p.add_argument("--allowed-paths", type=str, default="")
     p.add_argument("--batch-size", type=int, default=10)
@@ -792,7 +925,7 @@ if __name__ == "__main__":
     a = parse_args()
 
     # =========================
-    # ★ DBモード：sitesテーブルの pending を処理
+    # DBモード：sitesテーブルの pending を処理
     # =========================
     if a.from_db:
         eng = db_engine_from_env()
@@ -800,10 +933,10 @@ if __name__ == "__main__":
             eng,
             limit=int(a.limit),
             only_site_id=a.only_site_id,
-            pending_only=(a.only_site_id is None),  # only指定ならpending以外でも処理可能
+            pending_only=(a.only_site_id is None),
         )
 
-        print(f"[db] sites found: {len(rows)} (limit={a.limit})")
+        log.info(f"[db] sites found: {len(rows)} (limit={a.limit})")
 
         for r in rows:
             site_id = int(r["id"])
@@ -811,21 +944,18 @@ if __name__ == "__main__":
             scope = r.get("scope")
             st = str(r.get("status") or "")
 
-            # only指定がないときだけ pending 以外スキップ
             if a.only_site_id is None and st != "pending":
                 continue
 
             try:
-                print("\n==============================")
-                print(f"[site] id={site_id} scope={scope} url={seed_url}")
-                print("==============================")
+                log.info("==============================")
+                log.info(f"[site] id={site_id} scope={scope} url={seed_url}")
+                log.info("==============================")
 
-                # ★ フロント想定の status に合わせる
                 set_site_status(eng, site_id, "crawling", last_error=None)
 
                 allowed_paths_from_scope, max_pages_override, urls_override = derive_allowed_from_scope(seed_url, scope)
 
-                # CLI allowed_paths が指定されていれば優先（従来互換）
                 allowed_cli = [s.strip() for s in a.allowed_paths.split(",") if s.strip()]
                 allowed_paths = allowed_cli if allowed_cli else allowed_paths_from_scope
 
@@ -842,7 +972,7 @@ if __name__ == "__main__":
                     sleep_sec=float(a.sleep_sec),
                     max_chars=int(a.max_chars),
                     overlap=int(a.overlap),
-                    resume_from=0,   # ★ DBモードは毎回先頭から
+                    resume_from=0,
                     dry_run=a.dry_run,
                     urls_override=urls_override,
                 )
@@ -857,20 +987,20 @@ if __name__ == "__main__":
 
             except Exception as e:
                 err = str(e)
-                print(f"[site] ERROR site_id={site_id}: {err}")
+                log.exception(f"[site] ERROR site_id={site_id}: {err}")
                 set_site_status(eng, site_id, "error", last_error=err)
 
-        print("\n[db] ALL DONE")
+        log.info("[db] ALL DONE")
         raise SystemExit(0)
 
     # =========================
-    # sites.yml モード（従来）
+    # sites.yml モード
     # =========================
     if a.sites_yml:
         sites = load_sites_yml(a.sites_yml)
 
         allowed_common = [s.strip() for s in a.allowed_paths.split(",") if s.strip()]
-        print(f"[ingest] sites_yml={a.sites_yml} sites={len(sites)}")
+        log.info(f"[ingest] sites_yml={a.sites_yml} sites={len(sites)}")
 
         for s in sites:
             site_id = s["site_id"]
@@ -885,12 +1015,12 @@ if __name__ == "__main__":
             overlap = int(s["overlap"]) if s["overlap"] is not None else int(a.overlap)
             resume_from = int(s["resume_from"]) if s["resume_from"] is not None else a.resume_from
 
-            print("\n==============================")
-            print(f"[site] site_id={site_id}")
-            print(f"[site] seed_url={seed_url}")
-            print(f"[site] allowed_paths={allowed_paths}")
-            print(f"[site] max_pages={max_pages} batch_size={batch_size}")
-            print("==============================")
+            log.info("==============================")
+            log.info(f"[site] site_id={site_id}")
+            log.info(f"[site] seed_url={seed_url}")
+            log.info(f"[site] allowed_paths={allowed_paths}")
+            log.info(f"[site] max_pages={max_pages} batch_size={batch_size}")
+            log.info("==============================")
 
             run_ingest(
                 site_id=site_id,
@@ -905,11 +1035,11 @@ if __name__ == "__main__":
                 dry_run=a.dry_run,
             )
 
-        print("\n[ingest] ALL SITES DONE")
+        log.info("[ingest] ALL SITES DONE")
         raise SystemExit(0)
 
     # =========================
-    # 単体モード（従来互換）
+    # 単体モード
     # =========================
     if a.site_id is None or a.seed_url is None:
         raise SystemExit("error: --site-id and --seed-url are required unless --sites-yml is provided or --from-db")

@@ -1,5 +1,6 @@
 # database.py
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -10,6 +11,13 @@ DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set (Render env var or .env locally).")
+
+# ★ sqlite の相対パスを「このファイル(database.py)の場所基準」で固定する
+# .env は DATABASE_URL=sqlite:///./app.db のままでOK
+if DATABASE_URL.startswith("sqlite:///./"):
+    filename = DATABASE_URL.replace("sqlite:///./", "")
+    db_path = (Path(__file__).resolve().parent / filename)
+    DATABASE_URL = f"sqlite:///{db_path.as_posix()}"
 
 # postgresql:// でも psycopg に寄せる
 if DATABASE_URL.startswith("postgresql://"):
