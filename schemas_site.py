@@ -11,13 +11,8 @@ class SiteResponse(BaseModel):
     scope: str
     type: str
     status: str
-    ingested_urls: int | None
-
-    model_config = ConfigDict(from_attributes=True)
-
-class SiteResponse(SiteCreate):
-    id: int
-    status: str
+    ingested_urls: int | None = None
+    error_message: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

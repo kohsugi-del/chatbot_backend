@@ -1,8 +1,33 @@
 sites:
-  - site_id: 1
-    seed_url: "https://hataraku-asahikawa.jp/"
-    allowed_paths:
-      - "/column/"
-    max_pages: 50
-    batch_size: 5
 
+  # ═══════════════════════════════════════════════════════
+  # サイト①: hataraku-asahikawa.jp（WordPress）
+  # WP REST API 差分取り込み
+  # ═══════════════════════════════════════════════════════
+  - site_id: 1
+    type: wordpress
+    seed_url: "https://hataraku-asahikawa.jp/"
+    post_types:
+      - posts   # お知らせ・コラム（7件）
+      - pages   # 固定ページ（42件）
+    batch_size: 10
+    exclude_slugs:
+      - search_result
+      - search_company
+      - search
+      - job_seeker
+      - homepage
+
+  # ═══════════════════════════════════════════════════════
+  # サイト②: plus.hataraku-asahikawa.jp（独自求人システム）
+  # sitemap 経由で企業情報ページ（212社）をHTMLクロール
+  # ═══════════════════════════════════════════════════════
+  - site_id: 2
+    type: html
+    seed_url: "https://plus.hataraku-asahikawa.jp/"
+    sitemap_url: "https://plus.hataraku-asahikawa.jp/companysitemap.xml"
+    allowed_query_values:
+      app_controller: "info"
+      type: "cUser"
+    max_pages: 250
+    batch_size: 10

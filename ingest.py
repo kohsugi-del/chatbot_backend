@@ -850,6 +850,57 @@ def ingest_site_from_db(
 
 
 # ==============
+# sitemap_url 直接指定でURL一覧を取得
+# ==============
+def _load_urls_from_sitemap(
+    sitemap_url: str,
+    base_url: str,
+    allowed_query_values: dict,
+    max_pages: int,
+) -> list[str]:
+    """
+    指定サイトマップから URL を取得し、allowed_query_values でフィルタして返す。
+    - allowed_query_values: {"app_controller": "info", "type": "cUser"} のように指定
+    """
+    try:
+        r = session.get(sitemap_url, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        log.warning(f"_load_urls_from_sitemap: GET failed {sitemap_url}: {e}")
+        return []
+
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(r.text)
+    except Exception as e:
+        log.warning(f"_load_urls_from_sitemap: XML parse failed: {e}")
+        return []
+
+    urls: list[str] = []
+    for loc in root.iter():
+        if not loc.tag.endswith("loc") or not loc.text:
+            continue
+        u = loc.text.strip()
+
+        # allowed_query_values フィルタ
+        if allowed_query_values:
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(u).query)
+            match = all(
+                qs.get(k, [None])[0] == v
+                for k, v in allowed_query_values.items()
+            )
+            if not match:
+                continue
+
+        urls.append(normalize_url(u))
+        if len(urls) >= max_pages:
+            break
+
+    return urls
+
+
+# ==============
 # sites.yml 読み込み（複数サイト）
 # ==============
 def load_sites_yml(path: str) -> list[dict]:
@@ -885,6 +936,7 @@ def load_sites_yml(path: str) -> list[dict]:
 
         norm.append({
             "site_id": int(site_id),
+            "type": str(s.get("type", "html")),
             "seed_url": str(seed_url),
             "allowed_paths": allowed_paths,
             "max_pages": s.get("max_pages"),
@@ -893,6 +945,8 @@ def load_sites_yml(path: str) -> list[dict]:
             "max_chars": s.get("max_chars"),
             "overlap": s.get("overlap"),
             "resume_from": s.get("resume_from"),
+            "sitemap_url": s.get("sitemap_url"),          # 直接指定サイトマップ
+            "allowed_query_values": s.get("allowed_query_values", {}),  # URLクエリフィルタ
         })
     return norm
 
@@ -1003,20 +1057,37 @@ if __name__ == "__main__":
         log.info(f"[ingest] sites_yml={a.sites_yml} sites={len(sites)}")
 
         for s in sites:
-            site_id = s["site_id"]
+            site_id  = s["site_id"]
             seed_url = s["seed_url"]
+            site_type = s.get("type", "html")
+
+            # type: wordpress は wp_ingest.py が担当するためスキップ
+            if site_type == "wordpress":
+                log.info(f"[site] site_id={site_id} type=wordpress → skip (handled by wp_ingest.py)")
+                continue
 
             allowed_paths = s["allowed_paths"] if s["allowed_paths"] else allowed_common
 
-            max_pages = int(s["max_pages"]) if s["max_pages"] is not None else int(a.max_pages)
+            max_pages  = int(s["max_pages"])  if s["max_pages"]  is not None else int(a.max_pages)
             batch_size = int(s["batch_size"]) if s["batch_size"] is not None else int(a.batch_size)
-            sleep_sec = float(s["sleep_sec"]) if s["sleep_sec"] is not None else float(a.sleep_sec)
-            max_chars = int(s["max_chars"]) if s["max_chars"] is not None else int(a.max_chars)
-            overlap = int(s["overlap"]) if s["overlap"] is not None else int(a.overlap)
+            sleep_sec  = float(s["sleep_sec"]) if s["sleep_sec"] is not None else float(a.sleep_sec)
+            max_chars  = int(s["max_chars"])  if s["max_chars"]  is not None else int(a.max_chars)
+            overlap    = int(s["overlap"])    if s["overlap"]    is not None else int(a.overlap)
             resume_from = int(s["resume_from"]) if s["resume_from"] is not None else a.resume_from
 
+            # sitemap_url が指定されていればそのサイトマップからURL取得
+            sitemap_url = s.get("sitemap_url")
+            allowed_query_values = s.get("allowed_query_values", {})
+            urls_override = None
+            if sitemap_url:
+                log.info(f"[site] sitemap_url={sitemap_url}")
+                urls_override = _load_urls_from_sitemap(
+                    sitemap_url, seed_url, allowed_query_values, max_pages
+                )
+                log.info(f"[site] sitemap URLs loaded: {len(urls_override)}")
+
             log.info("==============================")
-            log.info(f"[site] site_id={site_id}")
+            log.info(f"[site] site_id={site_id} type={site_type}")
             log.info(f"[site] seed_url={seed_url}")
             log.info(f"[site] allowed_paths={allowed_paths}")
             log.info(f"[site] max_pages={max_pages} batch_size={batch_size}")
@@ -1033,6 +1104,7 @@ if __name__ == "__main__":
                 overlap=overlap,
                 resume_from=resume_from,
                 dry_run=a.dry_run,
+                urls_override=urls_override,
             )
 
         log.info("[ingest] ALL SITES DONE")

@@ -10,5 +10,5 @@ class Site(Base):
     type = Column(String, nullable=False)
     status = Column(String, nullable=False, default="pending")
 
-    # ★ 追加
     ingested_urls = Column(Integer, nullable=True)
+    error_message = Column(String, nullable=True)
