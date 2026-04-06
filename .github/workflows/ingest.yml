@@ -116,8 +116,9 @@ jobs:
           fi
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          # 新しいファイルを退避してからpull、その後復元（stashによるコンフリクト回避）
+          # 新しい内容を退避 → ファイルをHEADに戻す → pull → 復元してcommit
           cp "$LAST_RUN" /tmp/wp_last_run_new.json
+          git checkout -- "$LAST_RUN"
           git pull --rebase origin main
           cp /tmp/wp_last_run_new.json "$LAST_RUN"
           git add "$LAST_RUN"
