@@ -27,6 +27,9 @@ on:
 permissions:
   contents: write   # wp_last_run.json をコミットするために必要
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   ingest:
     runs-on: ubuntu-latest
