@@ -1108,6 +1108,10 @@ if __name__ == "__main__":
             seed_url = s["seed_url"]
             site_type = s.get("type", "html")
 
+            # --site-id で特定サイトのみ実行
+            if a.site_id is not None and site_id != a.site_id:
+                continue
+
             # type: wordpress は wp_ingest.py が担当するためスキップ
             if site_type == "wordpress":
                 log.info(f"[site] site_id={site_id} type=wordpress → skip (handled by wp_ingest.py)")

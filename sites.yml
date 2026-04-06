@@ -32,3 +32,16 @@ sites:
     max_pages: 300
     batch_size: 10
     delete_removed: true   # sitemapから消えたURLをDBから自動削除
+
+  # ═══════════════════════════════════════════════════════
+  # サイト③: 旭川市移住定住サイト
+  # https://www.city.asahikawa.hokkaido.jp/1400/ijyu/
+  # ═══════════════════════════════════════════════════════
+  - site_id: 3
+    type: html
+    seed_url: "https://www.city.asahikawa.hokkaido.jp/1400/ijyu/index.html"
+    allowed_paths:
+      - "/1400/ijyu/"
+    max_pages: 200
+    batch_size: 10
+    delete_removed: true

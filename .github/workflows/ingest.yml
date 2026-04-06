@@ -116,9 +116,10 @@ jobs:
           fi
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git stash push --include-untracked "$LAST_RUN"
+          # 新しいファイルを退避してからpull、その後復元（stashによるコンフリクト回避）
+          cp "$LAST_RUN" /tmp/wp_last_run_new.json
           git pull --rebase origin main
-          git stash pop
+          cp /tmp/wp_last_run_new.json "$LAST_RUN"
           git add "$LAST_RUN"
           git diff --staged --quiet || git commit -m "chore: update wp_last_run.json [skip ci]"
           git push origin main
