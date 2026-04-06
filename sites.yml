@@ -25,9 +25,10 @@ sites:
   - site_id: 2
     type: html
     seed_url: "https://plus.hataraku-asahikawa.jp/"
-    sitemap_url: "https://plus.hataraku-asahikawa.jp/companysitemap.xml"
+    sitemap_url: "https://plus.hataraku-asahikawa.jp/midsitemap.xml"
     allowed_query_values:
       app_controller: "info"
-      type: "cUser"
-    max_pages: 250
+      type: "mid"
+    max_pages: 300
     batch_size: 10
+    delete_removed: true   # sitemapから消えたURLをDBから自動削除

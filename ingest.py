@@ -850,6 +850,53 @@ def ingest_site_from_db(
 
 
 # ==============
+# sitemap差分: 削除されたURLをSupabaseから消す
+# ==============
+def _get_all_urls_supabase(site_id: int) -> set[str]:
+    """Supabase の documents テーブルから site_id に紐づく全URLを取得"""
+    urls: set[str] = set()
+    try:
+        offset = 0
+        while True:
+            r = (
+                supabase.table("documents")
+                .select("url")
+                .eq("site_id", site_id)
+                .range(offset, offset + 999)
+                .execute()
+            )
+            rows = r.data or []
+            for row in rows:
+                if row.get("url"):
+                    urls.add(row["url"])
+            if len(rows) < 1000:
+                break
+            offset += 1000
+    except Exception as e:
+        log.warning(f"_get_all_urls_supabase error: {e}")
+    return urls
+
+
+def _delete_removed_urls(site_id: int, current_urls: set[str], dry_run: bool = False):
+    """sitemapから消えたURLをSupabaseのdocuments/page_fingerprintsから削除"""
+    existing = _get_all_urls_supabase(site_id)
+    to_delete = existing - current_urls
+    if not to_delete:
+        log.info(f"[delete] 削除対象なし site_id={site_id}")
+        return
+    log.info(f"[delete] 削除対象={len(to_delete)}件 site_id={site_id}")
+    for url in to_delete:
+        log.info(f"  [delete] {url}")
+        if dry_run:
+            continue
+        try:
+            supabase.table("documents").delete().eq("site_id", site_id).eq("url", url).execute()
+            supabase.table("page_fingerprints").delete().eq("site_id", site_id).eq("url", url).execute()
+        except Exception as e:
+            log.warning(f"  delete error {url}: {e}")
+
+
+# ==============
 # sitemap_url 直接指定でURL一覧を取得
 # ==============
 def _load_urls_from_sitemap(
@@ -1078,6 +1125,7 @@ if __name__ == "__main__":
             # sitemap_url が指定されていればそのサイトマップからURL取得
             sitemap_url = s.get("sitemap_url")
             allowed_query_values = s.get("allowed_query_values", {})
+            delete_removed = bool(s.get("delete_removed", False))
             urls_override = None
             if sitemap_url:
                 log.info(f"[site] sitemap_url={sitemap_url}")
@@ -1085,6 +1133,8 @@ if __name__ == "__main__":
                     sitemap_url, seed_url, allowed_query_values, max_pages
                 )
                 log.info(f"[site] sitemap URLs loaded: {len(urls_override)}")
+                # サイトマップ方式は毎回URLリストが変わるためcursorを必ずリセット
+                resume_from = 0
 
             log.info("==============================")
             log.info(f"[site] site_id={site_id} type={site_type}")
@@ -1106,6 +1156,10 @@ if __name__ == "__main__":
                 dry_run=a.dry_run,
                 urls_override=urls_override,
             )
+
+            # sitemap差分: 消えた求人をDBから削除
+            if delete_removed and urls_override is not None:
+                _delete_removed_urls(site_id, set(urls_override), dry_run=a.dry_run)
 
         log.info("[ingest] ALL SITES DONE")
         raise SystemExit(0)
