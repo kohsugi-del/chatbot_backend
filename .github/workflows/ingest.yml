@@ -118,4 +118,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git add "$LAST_RUN"
           git diff --staged --quiet || git commit -m "chore: update wp_last_run.json [skip ci]"
-          git push
+          git pull --rebase origin main
+          git push origin main
