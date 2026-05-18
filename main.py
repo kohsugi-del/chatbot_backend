@@ -63,6 +63,7 @@ class ChatBody(BaseModel):
     question: Optional[str] = None
     message: Optional[str] = None
     top_k: int = 8
+    session_id: Optional[str] = None  # フロントから引き継ぐ場合に使用
 
 
 def get_question(body: ChatBody) -> str:
@@ -84,12 +85,40 @@ def build_refs(retrieved):
 
 
 @app.post("/chat")
-def chat(body: ChatBody):
+def chat(body: ChatBody, db: Session = Depends(get_db)):
     q = get_question(body)
+
+    # ── セッション作成 or 再利用 ──────────────────────────────
+    session_id = body.session_id
+    if not session_id:
+        session_obj = SessionLog(municipality_id="htrk-asahikawa")
+        db.add(session_obj)
+        db.commit()
+        db.refresh(session_obj)
+        session_id = session_obj.id
+
+    # ── ユーザーターン保存 ────────────────────────────────────
+    try:
+        turn_order = db.query(TurnLog).filter(TurnLog.session_id == session_id).count() + 1
+        db.add(TurnLog(session_id=session_id, turn_order=turn_order, role="user", content=q))
+        db.commit()
+    except Exception:
+        log.exception("[log] failed to save user turn")
+
+    # ── RAG 回答 ─────────────────────────────────────────────
     retrieved = search(q, top_k=body.top_k)
     ans = answer(q, retrieved)
     refs = build_refs(retrieved)
-    return {"answer": ans, "references": refs}
+
+    # ── アシスタントターン保存 ────────────────────────────────
+    try:
+        turn_order2 = db.query(TurnLog).filter(TurnLog.session_id == session_id).count() + 1
+        db.add(TurnLog(session_id=session_id, turn_order=turn_order2, role="assistant", content=ans))
+        db.commit()
+    except Exception:
+        log.exception("[log] failed to save assistant turn")
+
+    return {"answer": ans, "references": refs, "session_id": session_id}
 
 
 @app.post("/ask")
@@ -116,11 +145,14 @@ from database import SessionLocal, engine
 from sqlalchemy.orm import Session
 from models_site import Site
 from models_file import File as FileModel
+from models_log import SessionLog, TurnLog
 from schemas_site import SiteCreate, SiteResponse, ReingestResponse
 from schemas_file import FileResponse
 
 Site.metadata.create_all(bind=engine)
 FileModel.metadata.create_all(bind=engine)
+SessionLog.metadata.create_all(bind=engine)
+TurnLog.metadata.create_all(bind=engine)
 
 
 def get_db():

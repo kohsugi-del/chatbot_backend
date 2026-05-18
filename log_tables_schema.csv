@@ -1,0 +1,13 @@
+table,column,type,nullable,default,note
+sessions,id,uuid,NO,gen_random_uuid(),主キー
+sessions,municipality_id,text,NO,htrk-asahikawa,自治体識別ID（旭川市固定）
+sessions,started_at,timestamptz,NO,now(),会話開始日時
+turns,id,uuid,NO,gen_random_uuid(),主キー
+turns,session_id,uuid,YES,,sessions.id への外部キー
+turns,turn_order,integer,NO,,会話内の順番（1始まり）
+turns,role,text,NO,,'user' または 'assistant'
+turns,content,text,NO,,発話テキスト
+turns,user_type,text,YES,,'jobseeker' / 'company' / 'other'（6月以降に自動付与予定）
+turns,topic_type,text,YES,,'job' / 'site_usage' / 'other'（6月以降に自動付与予定）
+turns,bias_type,text,YES,,'loss_aversion' / 'status_quo' / 'choice_overload'（6月以降に自動付与予定）
+turns,created_at,timestamptz,NO,now(),発話日時
