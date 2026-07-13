@@ -313,7 +313,7 @@ def delete_file(file_id: int, db: Session = Depends(get_db)):
 # ingest 実行（ローカル実行）
 # =========================
 from ingest import ingest_site_from_db
-from pdf_ingest import ingest_pdf
+from pdf_ingest import ingest_document
 
 
 def _set_site_status(db: Session, site_id: int, status: str, error_message: Optional[str] = None):
@@ -373,14 +373,14 @@ def reingest_local(site_id: int, background_tasks: BackgroundTasks, db: Session 
     return {"status": "queued", "site_id": site_id}
 
 
-# ✅ ファイル：PDF ingest を実行（同期、状態更新あり）
+# ✅ ファイル：ingest を実行（PDF/DOCX/TXT対応、同期、状態更新あり）
 @app.post("/files/{file_id}/ingest_local")
 def ingest_file_local(file_id: int, db: Session = Depends(get_db)):
     f = db.query(FileModel).filter(FileModel.id == file_id).first()
     if not f:
         raise HTTPException(status_code=404, detail="File not found")
 
-    pdf_path = os.path.join(DATA_DIR, f.filename)
+    file_path = os.path.join(DATA_DIR, f.filename)
 
     # status カラムがあるなら crawling に
     if hasattr(f, "status"):
@@ -390,7 +390,7 @@ def ingest_file_local(file_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     try:
-        result = ingest_pdf(file_id=file_id, pdf_path=pdf_path, file_name=f.filename)
+        result = ingest_document(file_id=file_id, file_path=file_path, file_name=f.filename)
 
         if hasattr(f, "status"):
             f.status = "done"  # type: ignore[attr-defined]

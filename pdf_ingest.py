@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import pypdf
+from docx import Document
 from openai import OpenAI
 from supabase import create_client
 
@@ -24,6 +25,36 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         texts.append(page.extract_text() or "")
     return "\n".join(texts).strip()
 
+def extract_text_from_docx(docx_path: str) -> str:
+    doc = Document(docx_path)
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    parts.append(cell.text)
+    return "\n".join(parts).strip()
+
+def extract_text_from_txt(txt_path: str) -> str:
+    for enc in ("utf-8", "cp932"):
+        try:
+            with open(txt_path, "r", encoding=enc) as f:
+                return f.read().strip()
+        except UnicodeDecodeError:
+            continue
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read().strip()
+
+def extract_text(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return extract_text_from_pdf(file_path)
+    if ext == ".docx":
+        return extract_text_from_docx(file_path)
+    if ext == ".txt":
+        return extract_text_from_txt(file_path)
+    raise RuntimeError(f"未対応のファイル形式です: {ext}")
+
 def chunk_text(text: str, size: int = 900, overlap: int = 150) -> List[str]:
     if not text:
         return []
@@ -38,10 +69,10 @@ def embed_texts(chunks: List[str]) -> List[List[float]]:
     res = client.embeddings.create(model=EMBED_MODEL, input=chunks)
     return [d.embedding for d in res.data]
 
-def ingest_pdf(file_id: int, pdf_path: str, file_name: str):
-    text = extract_text_from_pdf(pdf_path)
+def ingest_document(file_id: int, file_path: str, file_name: str):
+    text = extract_text(file_path)
     if not text:
-        raise RuntimeError("PDFからテキストが抽出できませんでした（スキャンPDFの可能性）")
+        raise RuntimeError("ファイルからテキストが抽出できませんでした（スキャンPDFや空ファイルの可能性）")
 
     chunks = chunk_text(text)
     vectors = embed_texts(chunks)
