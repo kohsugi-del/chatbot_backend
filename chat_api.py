@@ -1,10 +1,14 @@
+import os
 from fastapi import FastAPI
 from pydantic import BaseModel
 import requests
 from openai import OpenAI
+from dotenv import load_dotenv
 
-SUPABASE_URL = "https://qpkgxwbrptaweahtkhjy.supabase.co"
-SERVICE_ROLE_KEY = "sb_secret_7YGTOkKLUdpLQSTozMOtlw_6OAEdD_w"
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 client = OpenAI()
 

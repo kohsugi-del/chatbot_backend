@@ -1,31 +1,35 @@
-import requests
 import os
-import numpy as np
 from dotenv import load_dotenv
+from supabase import create_client
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("SUPABASE_KEY")
+    or os.getenv("SUPABASE_ANON_KEY")
+    or ""
+).strip()
 
-FN_URL = f"{SUPABASE_URL}/functions/v1/save_embedding"
+_client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def save_to_supabase(content: str, embedding, source: str | None = None):
-    payload = {
-        "content": content,
-        "embedding": embedding if isinstance(embedding, list) else embedding.tolist(),
-    }
+def save_to_supabase(
+    content: str,
+    embedding,
+    source: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """documentsテーブルに1チャンクをINSERT（Edgeファンクション不要）"""
+    emb = embedding if isinstance(embedding, list) else list(embedding)
 
+    row: dict = {"content": content, "embedding": emb}
     if source:
-        payload["source"] = source
+        row["source"] = source
+        row["source_url"] = source
+    if title:
+        row["title"] = title
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {SERVICE_ROLE_KEY}",
-    }
-
-    res = requests.post(FN_URL, json=payload, headers=headers)
-    res.raise_for_status()
-    return res.json()
-
+    result = _client.table("documents").insert(row).execute()
+    return result.data[0] if result.data else {}

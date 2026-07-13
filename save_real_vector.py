@@ -1,10 +1,14 @@
 # save_real_vector.py
+import os
 import numpy as np
 import requests
 from openai import OpenAI
+from dotenv import load_dotenv
 
-SUPABASE_URL = "https://qpkgxwbrptaweahtkhjy.supabase.co"
-SERVICE_ROLE_KEY = "sb_secret_7YGTOkKLUdpLQSTozMOtlw_6OAEdD_w"
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 FN_URL = f"{SUPABASE_URL}/functions/v1/save_embedding"
 

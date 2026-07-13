@@ -1,15 +1,31 @@
+# rag_core.py
+# 埋め込み・インデクシング: OpenAI text-embedding-3-small（変更なし）
+# 回答生成: Google Gemini gemini-2.5-flash
+# 対象サイト: asahikawa-gas.co.jp
+
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
+from google import genai
+from google.genai import types
 from typing import List, Dict
 from supabase_writer import save_to_supabase
 
-print("🎉 rag_core がロードされました")
+# ============ OpenAI（埋め込みのみ）============
+openai_client = OpenAI()
 
-# ============ OpenAI ============
-client = OpenAI()
+# ============ Gemini（回答生成）============
+genai_client = genai.Client()
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# システムプロンプト（プロンプトキャッシュ対象・固定テキスト）
+SYSTEM_PROMPT = """あなたは旭川ガス（asahikawa-gas.co.jp）専用の案内チャットボットです。
+以下の資料だけを根拠に回答してください。
+推測や一般論は書かないでください。
+ガス漏れ・異臭・一酸化炭素中毒などの緊急事態は即座に「安全な場所に移動し、旭川ガスの緊急連絡先に電話してください」と案内してください。"""
+
 
 # ============ 1. Web ============
 def load_web_urls(urls: List[str]) -> List[Dict]:
@@ -61,9 +77,9 @@ def chunk_docs(
     return chunks
 
 
-# ============ 4. Embedding（バッチ） ============
+# ============ 4. Embedding（OpenAI・変更なし）============
 def embed_batch(texts: List[str]):
-    res = client.embeddings.create(
+    res = openai_client.embeddings.create(
         model="text-embedding-3-small",
         input=texts,
     )
@@ -74,9 +90,8 @@ def embed_batch(texts: List[str]):
 def build_index(
     web_urls: List[str] | None = None,
     pdf_paths: List[str] | None = None,
-    max_chunks: int = 50,  # ★ 負荷制御
+    max_chunks: int = 50,
 ) -> int:
-
     web_urls = web_urls or []
     pdf_paths = pdf_paths or []
 
@@ -96,7 +111,6 @@ def build_index(
 
     embeddings = embed_batch(texts)
 
-    # Supabase 保存
     for chunk, emb in zip(chunks, embeddings):
         save_to_supabase(
             content=chunk["text"],
@@ -106,6 +120,8 @@ def build_index(
 
     return len(chunks)
 
+
+# ============ 6. 回答生成（Gemini）============
 def answer(query: str, retrieved_docs: list) -> str:
     """
     retrieved_docs: [
@@ -120,26 +136,13 @@ def answer(query: str, retrieved_docs: list) -> str:
             d["text"] for d, _ in retrieved_docs
         )
 
-    prompt = f"""
-あなたは「働くあさひかわ（hataraku-asahikawa.jp）」専用の案内チャットボットです。
-以下の資料だけを根拠に回答してください。
-推測や一般論は書かないでください。
-
-# 資料
-{context}
-
-# 質問
-{query}
-
-# 回答（日本語・簡潔）
-"""
-
-    res = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
+    response = genai_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=f"# 資料\n{context}\n\n# 質問\n{query}\n\n# 回答（日本語・簡潔）",
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=2048,
+        ),
     )
 
-    return res.choices[0].message.content
-
+    return response.text

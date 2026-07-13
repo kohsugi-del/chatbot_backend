@@ -7,6 +7,7 @@ from urllib.parse import (
     urlunparse,
     parse_qsl,
     urlencode,
+    quote,
 )
 from datetime import datetime, timezone
 
@@ -61,6 +62,8 @@ supabase: Client = create_client(
 
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
+session.verify = False
+requests.packages.urllib3.disable_warnings()
 
 # ★ FastAPI(uvicorn) のログに寄せる（BackgroundTasksでも追いやすい）
 log = logging.getLogger("uvicorn")
@@ -87,7 +90,7 @@ DENY_FRAGMENT = True   # #付きURLは除外
 
 # ★ クエリを残したい場合は許可キーを追加
 # /plus/ 配下は query が実体なので、ここが超重要
-ALLOW_QUERY_KEYS = {"page", "app_controller", "id", "type", "run"}
+ALLOW_QUERY_KEYS = {"page", "app_controller", "id", "type", "run", "page_id", "p", "cat", "post_type", "event", "s", "tribe_events_cat"}
 
 
 # ==============
@@ -126,7 +129,7 @@ def ensure_plus_search_run(u: str) -> str:
     # なるべく無限増殖を避けたいので、page が無ければ 1 を入れる（任意）
     # qd.setdefault("page", "1")
 
-    q = urlencode(sorted(qd.items()), doseq=True)
+    q = urlencode(sorted(qd.items()), doseq=True, quote_via=quote)
     return normalize_url(urlunparse((p.scheme, p.netloc, p.path, p.params, q, "")))
 
 def normalize_url(u: str) -> str:
@@ -154,7 +157,7 @@ def normalize_url(u: str) -> str:
             if k in ALLOW_QUERY_KEYS
         ]
         if pairs:
-            q = urlencode(pairs, doseq=True)
+            q = urlencode(pairs, doseq=True, quote_via=quote)
 
     # path を統一
     path = p.path or "/"
@@ -185,9 +188,11 @@ def is_allowed(url: str, base_host: str, allowed_paths: list[str]) -> bool:
     if DENY_FRAGMENT and p.fragment:
         return False
 
-    # ★ /plus/ 配下は query を許可、それ以外はDENY_QUERYなら落とす
+    # ★ /plus/ 配下、または ALLOW_QUERY_KEYS のみのクエリは許可、それ以外はDENY_QUERYなら落とす
     if DENY_QUERY and p.query and (not (p.path or "").startswith("/plus/")):
-        return False
+        q_keys = {k for k, _ in parse_qsl(p.query, keep_blank_values=True)}
+        if not (q_keys and q_keys <= ALLOW_QUERY_KEYS):
+            return False
 
      # ★ /plus/ は info&id のみ許可（クエリ無しの /plus/ や login.php は除外）
     if (p.path or "").startswith("/plus/"):
@@ -232,7 +237,7 @@ def extract_links(html: str, base_url: str) -> list[str]:
             links.append(absu)
     return links
 
-def extract_text(html: str) -> tuple[str, str]:
+def extract_text(html: bytes | str) -> tuple[str, str]:
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
@@ -680,7 +685,6 @@ def run_ingest(
                 log.info(f"  [GET] {u}")
 
                 r = session.get(u, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
-                r.encoding = r.apparent_encoding
 
                 if r.status_code != 200:
                     log.info(f"  - skip {u} status={r.status_code}")
@@ -691,7 +695,7 @@ def run_ingest(
                     log.info(f"  - skip {u} content-type={ct}")
                     continue
 
-                title, text_ = extract_text(r.text)
+                title, text_ = extract_text(r.content)
                 if len(text_) < 50:
                     log.info(f"  - skip {u} (too short)")
                     continue

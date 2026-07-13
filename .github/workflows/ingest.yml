@@ -1,9 +1,9 @@
-name: Weekly RAG Ingest
+name: Daily RAG Ingest
 
 on:
   schedule:
-    # 毎週月曜 3:00 JST（日曜 18:00 UTC）
-    - cron: "0 18 * * 0"
+    # 毎日 3:00 JST（前日 18:00 UTC）
+    - cron: "0 18 * * *"
 
   workflow_dispatch:
     inputs:

@@ -14,10 +14,35 @@ from typing import List, Optional
 import os, shutil, re, uuid, logging
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 from rag_core import answer
 from vector_search import search
+
+# =========================
+# DB（起動時に先にインポート）
+# =========================
+from database import SessionLocal, engine
+from sqlalchemy.orm import Session
+from models_site import Site
+from models_file import File as FileModel
+from models_log import SessionLog, TurnLog
+from schemas_site import SiteCreate, SiteResponse, ReingestResponse
+from schemas_file import FileResponse
+
+Site.metadata.create_all(bind=engine)
+FileModel.metadata.create_all(bind=engine)
+SessionLog.metadata.create_all(bind=engine)
+TurnLog.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 
 # =========================
 # App
@@ -34,8 +59,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        # 本番フロントがあるならここに追加
-        # "https://your-frontend-domain.example",
+        "https://chatbot-gus.vercel.app",
     ],
     allow_credentials=False,
     allow_methods=["*"],
@@ -136,31 +160,6 @@ def embed(body: ChatBody):
     retrieved = search(q, top_k=body.top_k)
     ans = answer(q, retrieved)
     return {"answer": ans}
-
-
-# =========================
-# DB（Site / File 管理のみ）
-# =========================
-from database import SessionLocal, engine
-from sqlalchemy.orm import Session
-from models_site import Site
-from models_file import File as FileModel
-from models_log import SessionLog, TurnLog
-from schemas_site import SiteCreate, SiteResponse, ReingestResponse
-from schemas_file import FileResponse
-
-Site.metadata.create_all(bind=engine)
-FileModel.metadata.create_all(bind=engine)
-SessionLog.metadata.create_all(bind=engine)
-TurnLog.metadata.create_all(bind=engine)
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # =========================
