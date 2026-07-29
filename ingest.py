@@ -245,8 +245,13 @@ def extract_text(html: bytes | str) -> tuple[str, str]:
 
     title = (soup.title.string.strip() if soup.title and soup.title.string else "")
 
+    # このサイト（テーマ: originalll）は<main>/<article>を持たず、本文は
+    # .wrapper_3_right .wp_contents に入っている。左サイドバーの階層メニュー
+    # (.wrapper_3_left) はdivタグ+独自classのため、上のdecomposeでは除去できない。
+    # 該当セレクタが無いテンプレート（トップページ等）では従来通りmain/bodyにフォールバック。
+    content_node = soup.select_one(".wrapper_3_right .wp_contents")
     main = soup.find("main")
-    node = main if main else soup.body
+    node = content_node or main or soup.body
     text = node.get_text("\n", strip=True) if node else soup.get_text("\n", strip=True)
 
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -310,6 +315,18 @@ def state_update(site_id: int, **kwargs):
 # ==============
 def upsert_documents(rows: list[dict]):
     supabase.table("documents").upsert(rows, on_conflict="site_id,url,chunk_index").execute()
+
+def delete_stale_chunks(site_id: int, url: str, keep_count: int):
+    # 再取込でチャンク数が減った場合、on_conflict upsertは新しいchunk_indexのみ上書きするため、
+    # 古い（今回生成されなかった）chunk_indexの行が残ってしまう。keep_count以上を削除して揃える。
+    (
+        supabase.table("documents")
+        .delete()
+        .eq("site_id", site_id)
+        .eq("url", url)
+        .gte("chunk_index", keep_count)
+        .execute()
+    )
 
 
 # ==============
@@ -750,6 +767,7 @@ def run_ingest(
                 ingested_urls_count += len(docs)
 
                 for (u, _title, _chunks, _page_hash) in docs:
+                    delete_stale_chunks(site_id, u, len(_chunks))
                     fingerprint_upsert(site_id, u, _page_hash)
 
                 log.info(f"[db] upserted {len(rows)} chunks (urls_ok={len(docs)})")
