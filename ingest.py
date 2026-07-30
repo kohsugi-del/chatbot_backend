@@ -132,12 +132,16 @@ def ensure_plus_search_run(u: str) -> str:
     q = urlencode(sorted(qd.items()), doseq=True, quote_via=quote)
     return normalize_url(urlunparse((p.scheme, p.netloc, p.path, p.params, q, "")))
 
-def normalize_url(u: str) -> str:
+def normalize_url(u: str, force_trailing_slash: bool = True) -> str:
     """
     URLの表記ゆれを統一して、visited/重複判定の精度を上げる。
     - fragment は必ず削除
     - query は原則削除（ALLOW_QUERY_KEYSだけ残す）
     - path 末尾スラッシュを統一（ただし .php 等の “ファイル” は付けない）
+
+    force_trailing_slash=False は scope=single（1URL指定）専用。サイトによっては
+    末尾スラッシュの有無でサーバーの挙動が変わり（例: hourei.netは付与すると500になる）、
+    クロール時の重複判定のための正規化を単一URL指定にまで適用すべきではないため。
     """
     u = (u or "").strip()
     if not u:
@@ -161,7 +165,7 @@ def normalize_url(u: str) -> str:
 
     # path を統一
     path = p.path or "/"
-    if path != "/" and (not _looks_like_file(path)) and (not path.endswith("/")):
+    if force_trailing_slash and path != "/" and (not _looks_like_file(path)) and (not path.endswith("/")):
         path += "/"
 
     return urlunparse((p.scheme, p.netloc, path, p.params, q, frag))
@@ -641,7 +645,11 @@ def run_ingest(
 
     # URLs決定
     if urls_override is not None:
-        urls = [normalize_url(u) for u in urls_override if normalize_url(u)]
+        urls = [
+            normalize_url(u, force_trailing_slash=False)
+            for u in urls_override
+            if normalize_url(u, force_trailing_slash=False)
+        ]
         crawl_mode = "override"
     else:
         # ★ /plus/ は sitemap が役に立たない（クエリ詳細が載らない）ので BFS 強制
@@ -692,7 +700,7 @@ def run_ingest(
         docs = []
         for u in batch_urls:
             try:
-                u = normalize_url(u)
+                u = normalize_url(u, force_trailing_slash=(crawl_mode != "override"))
                 if not u:
                     continue
 
@@ -804,7 +812,7 @@ def derive_allowed_from_scope(seed_url: str, scope: str | None) -> tuple[list[st
     path = pu.path or "/"
 
     if scope == "single":
-        return ([], 1, [normalize_url(seed_url)])
+        return ([], 1, [normalize_url(seed_url, force_trailing_slash=False)])
 
     if scope == "subtree":
         ap = _norm_path(path)
