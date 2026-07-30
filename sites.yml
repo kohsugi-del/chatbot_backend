@@ -1,47 +1,13 @@
 sites:
 
   # ═══════════════════════════════════════════════════════
-  # サイト①: hataraku-asahikawa.jp（WordPress）
-  # WP REST API 差分取り込み
+  # 旭川ガス公式サイト（HTMLクロール）
   # ═══════════════════════════════════════════════════════
   - site_id: 1
-    type: wordpress
-    seed_url: "https://hataraku-asahikawa.jp/"
-    post_types:
-      - posts   # お知らせ・コラム（7件）
-      - pages   # 固定ページ（42件）
-    batch_size: 10
-    exclude_slugs:
-      - search_result
-      - search_company
-      - search
-      - job_seeker
-      - homepage
-
-  # ═══════════════════════════════════════════════════════
-  # サイト②: plus.hataraku-asahikawa.jp（独自求人システム）
-  # sitemap 経由で企業情報ページ（212社）をHTMLクロール
-  # ═══════════════════════════════════════════════════════
-  - site_id: 2
     type: html
-    seed_url: "https://plus.hataraku-asahikawa.jp/"
-    sitemap_url: "https://plus.hataraku-asahikawa.jp/midsitemap.xml"
-    allowed_query_values:
-      app_controller: "info"
-      type: "mid"
-    max_pages: 300
-    batch_size: 10
-    delete_removed: true   # sitemapから消えたURLをDBから自動削除
-
-  # ═══════════════════════════════════════════════════════
-  # サイト③: 旭川市移住定住サイト
-  # https://www.city.asahikawa.hokkaido.jp/1400/ijyu/
-  # ═══════════════════════════════════════════════════════
-  - site_id: 3
-    type: html
-    seed_url: "https://www.city.asahikawa.hokkaido.jp/1400/ijyu/index.html"
+    seed_url: "https://asahikawa-gas.co.jp/"
     allowed_paths:
-      - "/1400/ijyu/"
+      - "/"
     max_pages: 200
     batch_size: 10
     delete_removed: true
