@@ -289,6 +289,20 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     )
     return [d.embedding for d in res.data]
 
+def _get_with_retry(u: str, retries: int = 1):
+    """一時的なネットワークエラー（タイムアウト・接続エラー等）に対して1回だけ再試行する"""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return session.get(u, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < retries:
+                log.info(f"  - retry after {type(e).__name__}: {u}")
+                time.sleep(1)
+    assert last_exc is not None
+    raise last_exc
+
 
 # ==============
 # Supabase: state
@@ -692,6 +706,7 @@ def run_ingest(
 
     ingested_urls_count = 0
     chunks_upserted_total = 0
+    skip_reasons: list[str] = []  # 「unchanged」以外の理由で取り込めなかったURL（override時のエラー判定に使う）
 
     while cursor < total:
         batch_urls = urls[cursor: cursor + batch_size]
@@ -709,20 +724,34 @@ def run_ingest(
                 # ★ どこで止まりやすいか分かるように（必要ならコメントアウトOK）
                 log.info(f"  [GET] {u}")
 
-                r = session.get(u, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+                r = _get_with_retry(u)
+
+                if r.status_code != 200:
+                    # ★ 末尾スラッシュ付与が原因で失敗するサイト向けフォールバック
+                    # （hourei.net等、スラッシュ有無でサーバー挙動が変わるケースを
+                    # 事前設定なしで自動的に回避する）
+                    if crawl_mode != "override" and u.endswith("/") and len(urlparse(u).path) > 1:
+                        alt_u = u.rstrip("/")
+                        log.info(f"  - retry without trailing slash: {alt_u}")
+                        r_alt = _get_with_retry(alt_u)
+                        if r_alt.status_code == 200:
+                            u, r = alt_u, r_alt
 
                 if r.status_code != 200:
                     log.info(f"  - skip {u} status={r.status_code}")
+                    skip_reasons.append(f"{u}: HTTP {r.status_code}")
                     continue
 
                 ct = (r.headers.get("Content-Type") or "").lower()
                 if ("text/html" not in ct) and ("application/xhtml+xml" not in ct):
                     log.info(f"  - skip {u} content-type={ct}")
+                    skip_reasons.append(f"{u}: 対応していないcontent-type（{ct or '(空)'}）")
                     continue
 
                 title, text_ = extract_text(r.content)
                 if len(text_) < 50:
                     log.info(f"  - skip {u} (too short)")
+                    skip_reasons.append(f"{u}: 本文が短すぎる（{len(text_)}文字）")
                     continue
 
                 page_hash = make_page_hash(title, text_)
@@ -734,6 +763,7 @@ def run_ingest(
                 chunks = chunk_text(text_, max_chars=max_chars, overlap=overlap)
                 if not chunks:
                     log.info(f"  - skip {u} (no chunks)")
+                    skip_reasons.append(f"{u}: チャンク生成失敗")
                     continue
 
                 docs.append((u, title, chunks, page_hash))
@@ -742,6 +772,7 @@ def run_ingest(
             except Exception as e:
                 log.exception(f"  ! error {u}: {e}")
                 state_update(site_id, last_error=str(e))
+                skip_reasons.append(f"{u}: {type(e).__name__}: {e}")
                 continue
 
         rows = []
@@ -785,6 +816,16 @@ def run_ingest(
 
         if cursor < total and sleep_sec > 0:
             time.sleep(sleep_sec)
+
+    # ★ override（scope=single等の明示URL指定）で1件も取り込めなかった場合、
+    # 「unchanged」以外の失敗理由があるなら黙って成功扱いにせずエラーとして扱う
+    # （末尾スラッシュ・content-type・ステータスコード等、URLの形式次第で起きる
+    # 取りこぼしをここで可視化する。fingerprintが一致した「変更なし」だけが理由の
+    # 場合は正常な再取込みなのでエラーにしない）
+    if crawl_mode == "override" and ingested_urls_count == 0 and skip_reasons:
+        err_msg = "; ".join(skip_reasons[:5])
+        state_update(site_id, status="failed", last_error=err_msg)
+        raise RuntimeError(f"URLを取り込めませんでした: {err_msg}")
 
     state_update(site_id, status="done", last_error=None)
     log.info("[ingest] DONE")
